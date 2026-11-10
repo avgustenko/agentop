@@ -43,7 +43,8 @@ try:
 except ImportError:
     termios = tty = None
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
+VIEWS = ("dashboard", "focus", "system", "compact", "minimal")
 COLOR = (sys.stdout.isatty() and "NO_COLOR" not in os.environ
          and os.environ.get("TERM") != "dumb")
 
@@ -104,6 +105,7 @@ THEMES = {
 
 DEFAULT_CONFIG = {
     "theme": "auto",
+    "view": "dashboard",
     "interval": 1.0,
     "history": 120,
     "history_interval": 2.0,
@@ -1316,6 +1318,9 @@ class App:
         self.h_temp = deque(maxlen=n)
         self.h_io = deque(maxlen=n)
         self.theme = Theme(cfg.get("theme", "auto"))
+        self.view = cfg.get("view", "dashboard")
+        if self.view not in VIEWS:
+            self.view = "dashboard"
         if threaded:
             self._limits_thread = threading.Thread(target=self._limits_worker, daemon=True)
             self._limits_thread.start()
@@ -1443,6 +1448,8 @@ def _header(app, data, W, show_ms):
     dot = "red" if lim.get("error") else pct_color(worst)
     left = (f"{t.c(dot, '●')} {t.c('accent', 'AGENTOP')} {t.c('dim', VERSION)} "
             f"{t.c('dim', '·')} {t.c('text', t.name)}")
+    if app.view != "dashboard":
+        left += f" {t.c('dim', '·')} {t.c('text', app.view)}"
     extras = []
     if W >= 80:
         if data.get("bat") and data["bat"].get("cap") is not None:
@@ -1459,27 +1466,27 @@ def _footer(app, W, paused):
     if paused:
         hint = f"{key(t, 'p')} продолжить   {key(t, 'q')} выход"
     else:
-        hint = (f"{key(t, 'r')} обновить   {key(t, 't')} тема   "
+        hint = (f"{key(t, 'r')} обновить   {key(t, 't')} тема   {key(t, 'v')} вид   "
                 f"{key(t, 'p')} пауза   {key(t, 'q')} выход")
     return frame_bottom(t, W, hint)
 
 
-def _single_column(app, data, W, H, show_ms, paused):
-    t = app.theme
-    decimals = _as_int(app.cfg.get("limit_decimals"), 3, 0, 6)
-    big = H >= 34
-    cw = W - 4
-    mem_title = "ПАМЯТЬ · ТЕМПЕРАТУРА" + (" · GPU" if data["gpu"] is not None else "")
-    top = _header(app, data, W, show_ms)
-    bottom = _footer(app, W, paused)
-
-    blocks = [
+def _agent_blocks(app, data, t, cw, decimals):
+    return [
         ("limits", "LIMITS", limits_lines(data["limits"], t, cw, decimals), False),
-        ("tokens", "ТОКЕНЫ · СЕГОДНЯ", tokens_lines(data["claude"], data["opencode"], t, cw), False),
+        ("tokens", "ТОКЕНЫ · СЕГОДНЯ",
+         tokens_lines(data["claude"], data["opencode"], t, cw), False),
         ("speed", "СКОРОСТЬ ТОКЕНОВ · 15 МИН", None, False),
+    ]
+
+
+def _system_blocks(app, data, t, cw):
+    mem_title = "ПАМЯТЬ · ТЕМПЕРАТУРА" + (" · GPU" if data["gpu"] is not None else "")
+    blocks = [
         ("cpu", "CPU", None, False),
         ("mem", mem_title,
-         mem_lines(data["mem"], data["temp"], data["gpu"], data["gpu_temp"], data["hist_temp"], t, cw), False),
+         mem_lines(data["mem"], data["temp"], data["gpu"], data["gpu_temp"],
+                   data["hist_temp"], t, cw), False),
         ("power", "ПИТАНИЕ", power_lines(data["bat"], t, cw), True),
     ]
     if data["disk"] or data["net"]:
@@ -1488,8 +1495,14 @@ def _single_column(app, data, W, H, show_ms, paused):
                                 data["hist_io"], t, cw), True))
     if data["procs"]:
         blocks.append(("procs", "ТОП ПРОЦЕССОВ", proc_lines(data["procs"], t, cw), True))
+    return blocks
 
-    pc = _as_bool(_show_cfg(app.cfg).get("per_core"), True)
+
+def _stacked(app, data, W, H, show_ms, paused, blocks, pc=True, big=False, options=None):
+    t = app.theme
+    cw = W - 4
+    top = _header(app, data, W, show_ms)
+    bottom = _footer(app, W, paused)
 
     def compose(per_core=True, optional=True, big_graph=big, tiny=False):
         out = [top]
@@ -1510,15 +1523,96 @@ def _single_column(app, data, W, H, show_ms, paused):
         out.append(bottom)
         return [clip(x, W) for x in out]
 
-    options = [(pc, True, big, False), (pc, False, big, False)]
-    if pc:
-        options.append((False, False, big, False))
-    options += [(False, False, False, False), (False, False, False, True)]
+    if options is None:
+        options = [(pc, True, big, False), (pc, False, big, False)]
+        if pc:
+            options.append((False, False, big, False))
+        options += [(False, False, False, False), (False, False, False, True)]
     for per_core, optional, big_graph, tiny in options:
         lines = compose(per_core, optional, big_graph, tiny)
         if len(lines) <= H:
             return lines
     return compose(False, False, False, True)[:H]
+
+
+def _single_column(app, data, W, H, show_ms, paused):
+    t = app.theme
+    decimals = _as_int(app.cfg.get("limit_decimals"), 3, 0, 6)
+    cw = W - 4
+    blocks = _agent_blocks(app, data, t, cw, decimals) + _system_blocks(app, data, t, cw)
+    pc = _as_bool(_show_cfg(app.cfg).get("per_core"), True)
+    return _stacked(app, data, W, H, show_ms, paused, blocks, pc=pc, big=H >= 34)
+
+
+def _focus_view(app, data, W, H, show_ms, paused):
+    t = app.theme
+    decimals = _as_int(app.cfg.get("limit_decimals"), 3, 0, 6)
+    cw = W - 4
+    blocks = _agent_blocks(app, data, t, cw, decimals)
+    big = H >= 26
+    return _stacked(app, data, W, H, show_ms, paused, blocks, pc=False,
+                    big=big, options=[(False, False, big, False)])
+
+
+def _system_view(app, data, W, H, show_ms, paused):
+    t = app.theme
+    cw = W - 4
+    blocks = _system_blocks(app, data, t, cw)
+    pc = _as_bool(_show_cfg(app.cfg).get("per_core"), True)
+    return _stacked(app, data, W, H, show_ms, paused, blocks, pc=pc, big=False)
+
+
+def _compact_view(app, data, W, H, show_ms, paused):
+    t = app.theme
+    decimals = _as_int(app.cfg.get("limit_decimals"), 3, 0, 6)
+    cw = W - 4
+    mem_title = "ПАМЯТЬ · ТЕМП"
+    blocks = _agent_blocks(app, data, t, cw, decimals)
+    blocks += [
+        ("cpu", "CPU", None, False),
+        ("mem", mem_title,
+         mem_lines(data["mem"], data["temp"], data["gpu"], data["gpu_temp"],
+                   data["hist_temp"], t, cw), False),
+    ]
+    return _stacked(app, data, W, H, show_ms, paused, blocks, pc=False,
+                    big=False, options=[(False, False, False, False)])
+
+
+def _minimal_view(app, data, W, H, show_ms, paused):
+    t = app.theme
+    decimals = _as_int(app.cfg.get("limit_decimals"), 3, 0, 6)
+    out = [_header(app, data, W, show_ms)]
+    lim = data.get("limits") or {}
+    for label, key_ in (("5h", "five_hour"), ("7d", "seven_day")):
+        o = lim.get(key_) or {}
+        used = o.get("utilization")
+        if used is None:
+            out.append(content_line(t, W, f"  {t.c('text', label)}  {t.c('dim', 'нет данных')}"))
+            continue
+        used = float(used)
+        rem = ""
+        if o.get("resets_at"):
+            try:
+                reset = datetime.fromisoformat(o["resets_at"].replace("Z", "+00:00")).timestamp()
+                rem = f"  {t.c('dim', '↻')} {human_left(reset - time.time())}"
+            except Exception:
+                pass
+        pct = f"{used:.{decimals}f}%"
+        out.append(content_line(t, W,
+            f"  {t.c('text', label)}  {t.bar(used, 14)} {t.c(pct_color(used), pct)}{rem}"))
+    snap = data["speed"].snapshot()
+    now_rate = snap["now"]
+    load0 = data["load"][0]
+    total = next((p for n, p in data["pcts"] if n == "cpu"), 0.0) or 0.0
+    bat = data["bat"] or {}
+    line = (f"  {t.c('dim', 'tok/s')} {t.c('green', f'{now_rate:.0f}')}"
+            f"  {t.c('dim', 'load')} {load0:.2f}"
+            f"  {t.c('dim', 'CPU')} {t.c(pct_color(total), f'{total:.0f}%')}")
+    if bat.get("cap") is not None:
+        line += f"  {t.c('dim', 'BAT')} {bat['cap']}%"
+    out.append(content_line(t, W, line))
+    out.append(_footer(app, W, paused))
+    return [clip(x, W) for x in out][:H]
 
 
 def _double_column(app, data, W, H, show_ms, paused):
@@ -1571,6 +1665,14 @@ def _double_column(app, data, W, H, show_ms, paused):
 
 
 def render(app, data, W, H, show_ms=False, paused=False):
+    if app.view == "focus":
+        return _focus_view(app, data, W, H, show_ms, paused)
+    if app.view == "system":
+        return _system_view(app, data, W, H, show_ms, paused)
+    if app.view == "compact":
+        return _compact_view(app, data, W, H, show_ms, paused)
+    if app.view == "minimal":
+        return _minimal_view(app, data, W, H, show_ms, paused)
     if W >= 96:
         return _double_column(app, data, W, H, show_ms, paused)
     return _single_column(app, data, W, H, show_ms, paused)
@@ -1634,6 +1736,8 @@ def main():
     ap.add_argument("--theme", help="тема на один запуск")
     ap.add_argument("--set-theme", help="сохранить тему в конфиг")
     ap.add_argument("--list-themes", action="store_true", help="список тем")
+    ap.add_argument("--view", choices=VIEWS, help="вид: " + ", ".join(VIEWS))
+    ap.add_argument("--list-views", action="store_true", help="список видов")
     ap.add_argument("--config", action="store_true", help="показать конфиг")
     ap.add_argument("--ms", action="store_true", help="часы с сантисекундами; включает -i 0.01 (нагружает)")
     ap.add_argument("--version", action="version", version=f"agentop {VERSION}")
@@ -1646,6 +1750,18 @@ def main():
         print("auto (по теме GNOME) +")
         for name in THEMES:
             print("  " + name)
+        return
+
+    if args.list_views:
+        desc = {
+            "dashboard": "агенты + система (две колонки на широких)",
+            "focus": "только лимиты, токены и скорость",
+            "system": "только железо",
+            "compact": "компактная одна колонка",
+            "minimal": "5–6 строк",
+        }
+        for v in VIEWS:
+            print(f"  {v:10s} {desc[v]}")
         return
 
     if args.set_theme:
@@ -1672,6 +1788,8 @@ def main():
                 or not (sys.stdout.isatty() and sys.stdin.isatty()))
 
     app = App(cfg, threaded=not one_shot)
+    if args.view:
+        app.view = args.view
     if args.refresh:
         app.force_limits = True
     interval = max(0.01, args.interval if args.interval is not None
@@ -1779,6 +1897,13 @@ def main():
                     sys.stdout.write("\033[H\033[J" + frame)
                     sys.stdout.flush()
                     last_frame = frame
+            elif ch in ("v", "V"):
+                idx = VIEWS.index(app.view) if app.view in VIEWS else 0
+                app.view = VIEWS[(idx + 1) % len(VIEWS)]
+                cfg["view"] = app.view
+                save_config(cfg)
+                last_frame = None
+                last_stamp = None
     except (KeyboardInterrupt, OSError):
         pass
     finally:

@@ -1,5 +1,6 @@
 {
   "theme": "auto",
+  "view": "dashboard",
   "interval": 1.0,
   "history": 120,
   "history_interval": 2.0,

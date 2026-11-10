@@ -33,6 +33,23 @@
 - **Low overhead** — ~0.4 % CPU, ~40 MB RAM, one wakeup per second, redraws only when data changes. Press `p` to pause (0 % CPU).
 - **Machine-readable** — `--short` (one line for a status bar) and `--json`.
 
+## Views
+
+Switch views with `v` (saved to config) or `--view`:
+
+| View | What it shows |
+|---|---|
+| `dashboard` | agents + system; two columns on wide terminals, one on narrow |
+| `focus` | only limits, tokens and token speed |
+| `system` | only hardware: CPU, memory/temp/GPU, power, disk/network, processes |
+| `compact` | single column, total CPU only — good for small panes |
+| `minimal` | 5–6 lines: limits, tok/s, load, CPU, battery |
+
+```bash
+agentop --view focus
+agentop --list-views
+```
+
 ## Requirements
 
 - Linux (reads `/proc` and `/sys`), Python 3.9+
@@ -67,6 +84,8 @@ agentop -i 2            # refresh every 2 s (default 1 s)
 agentop --theme nord    # theme for this run
 agentop --set-theme nord
 agentop --list-themes
+agentop --view focus    # view for this run
+agentop --list-views
 agentop --refresh       # drop caches, refetch limits
 agentop --config        # show config path + contents
 agentop --ms            # centisecond clock, ~100 FPS (heavy)
@@ -79,6 +98,7 @@ In the live view:
 |---|---|
 | `r` | refresh now (caches + limits) |
 | `t` | next theme (saved to config) |
+| `v` | next view (saved to config) |
 | `p` | pause / resume (0 % CPU while paused) |
 | `q` | quit |
 
@@ -89,6 +109,7 @@ In the live view:
 ```json
 {
   "theme": "auto",
+  "view": "dashboard",
   "interval": 1.0,
   "history": 120,
   "history_interval": 2.0,
