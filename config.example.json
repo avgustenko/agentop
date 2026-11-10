@@ -1,0 +1,15 @@
+{
+  "theme": "auto",
+  "interval": 1.0,
+  "history": 120,
+  "history_interval": 2.0,
+  "limit_decimals": 3,
+  "clock_ms": false,
+  "show": {
+    "network": true,
+    "disk": true,
+    "processes": true,
+    "gpu": true,
+    "per_core": true
+  }
+}

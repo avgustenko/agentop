@@ -1,0 +1,1802 @@
+#!/usr/bin/env python3
+"""
+agentop 1.0.0 — терминальный дашборд агентов и железа.
+
+  agentop                 живой виджет
+  agentop --once          один кадр
+  agentop --short         одна строка (статус-бар/промпт)
+  agentop --json          машинный формат
+  agentop --refresh       сбросить кэш и обновить данные
+  agentop --theme nord    тема на один запуск
+  agentop --set-theme nord  сохранить тему в конфиг
+  agentop --list-themes
+  agentop --config        путь к конфигу
+  agentop --ms            часы с сантисекундами (~100 FPS)
+
+В живом режиме: r — обновить, t — сменить тему, p — пауза, q — выход.
+
+Данные: лимиты Claude (официальный OAuth-эндпоинт), логи Claude Code,
+SQLite opencode, /proc, /sys. Секреты не выводятся и не кэшируются.
+"""
+
+import argparse
+import glob
+import json
+import os
+import re
+import select
+import shutil
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+from collections import deque
+from datetime import datetime
+from pathlib import Path
+
+try:
+    import termios
+    import tty
+except ImportError:
+    termios = tty = None
+
+VERSION = "1.0.0"
+COLOR = (sys.stdout.isatty() and "NO_COLOR" not in os.environ
+         and os.environ.get("TERM") != "dumb")
+
+HOME = Path.home()
+CONFIG_DIR = HOME / ".config" / "agentop"
+CONFIG_PATH = CONFIG_DIR / "config.json"
+CACHE_DIR = HOME / ".cache" / "agentop"
+
+# мягкая миграция со старого имени (agentstat)
+OLD_CONFIG = HOME / ".config" / "agentstat" / "config.json"
+OLD_CACHE = HOME / ".cache" / "agentstat"
+if not CONFIG_PATH.exists() and OLD_CONFIG.exists():
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(OLD_CONFIG, CONFIG_PATH)
+    except Exception:
+        pass
+if not CACHE_DIR.exists() and OLD_CACHE.exists():
+    try:
+        shutil.copytree(OLD_CACHE, CACHE_DIR)
+    except Exception:
+        pass
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+USAGE_CACHE = CACHE_DIR / "usage.json"
+CLAUDE_CACHE = CACHE_DIR / "claude_today.json"
+TAIL_CACHE = CACHE_DIR / "tail.json"
+
+TTL_LIMITS = 300
+TTL_CLAUDE = 300
+TTL_OC = 30.0
+TTL_CPU = 2.0
+TTL_SYS = 5.0
+TTL_IO = 5.0
+TTL_PROCS = 30.0
+TTL_SPEED = 15.0
+
+# ───────────────────────────── темы ─────────────────────────────
+THEMES = {
+    "catppuccin-mocha": dict(accent=183, blue=111, green=151, yellow=223,
+                             red=211, text=252, dim=243, palette=[111, 147, 183, 219]),
+    "catppuccin-latte": dict(accent=99, blue=33, green=34, yellow=172,
+                             red=160, text=236, dim=245, palette=[33, 63, 98, 133]),
+    "dracula":          dict(accent=141, blue=117, green=84, yellow=228,
+                             red=203, text=253, dim=61, palette=[117, 141, 171, 207]),
+    "nord":             dict(accent=109, blue=109, green=150, yellow=222,
+                             red=167, text=253, dim=244, palette=[110, 146, 175, 109]),
+    "gruvbox":          dict(accent=208, blue=109, green=142, yellow=214,
+                             red=167, text=223, dim=245, palette=[109, 142, 178, 208]),
+    "tokyo-night":      dict(accent=111, blue=111, green=114, yellow=179,
+                             red=203, text=252, dim=60, palette=[111, 141, 171, 204]),
+    "solarized-dark":   dict(accent=33, blue=33, green=64, yellow=136,
+                             red=160, text=230, dim=240, palette=[33, 37, 64, 136]),
+    "matrix":           dict(accent=46, blue=46, green=46, yellow=226,
+                             red=196, text=46, dim=22, palette=[22, 34, 40, 46]),
+    "mono":             dict(accent=250, blue=250, green=250, yellow=250,
+                             red=250, text=252, dim=240, palette=[244, 247, 250, 253]),
+}
+
+DEFAULT_CONFIG = {
+    "theme": "auto",
+    "interval": 1.0,
+    "history": 120,
+    "history_interval": 2.0,
+    "limit_decimals": 3,
+    "clock_ms": False,
+    "show": {"network": True, "disk": True, "processes": True, "gpu": True, "per_core": True},
+}
+
+
+def load_config():
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))
+    try:
+        user = json.loads(CONFIG_PATH.read_text())
+        for k, v in user.items():
+            if k == "show" and isinstance(v, dict):
+                cfg["show"].update(v)
+            else:
+                cfg[k] = v
+    except Exception:
+        pass
+    return cfg
+
+
+def save_config(cfg):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = CONFIG_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
+    tmp.replace(CONFIG_PATH)
+
+
+def resolve_theme(name):
+    if isinstance(name, str) and name in THEMES:
+        return name
+    if name != "auto":
+        name = "auto"
+    try:
+        out = subprocess.run(
+            ["gsettings", "get", "org.gnome.desktop.interface", "color-scheme"],
+            capture_output=True, text=True, timeout=2,
+        ).stdout
+        return "catppuccin-latte" if "prefer-dark" not in out else "catppuccin-mocha"
+    except Exception:
+        return "catppuccin-mocha"
+
+
+# ───────────────────────────── ANSI ─────────────────────────────
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def vlen(s):
+    return len(ANSI_RE.sub("", s))
+
+
+def clip(s, width):
+    if vlen(s) <= width:
+        return s
+    out, vis, i = [], 0, 0
+    while i < len(s) and vis < width - 1:
+        if s[i] == "\x1b":
+            m = ANSI_RE.match(s, i)
+            if m:
+                out.append(m.group())
+                i = m.end()
+                continue
+        out.append(s[i])
+        vis += 1
+        i += 1
+    out.append("…")
+    if COLOR:
+        out.append("\033[0m")
+    return "".join(out)
+
+
+def pad(s, width):
+    return s + " " * max(0, width - vlen(s))
+
+
+class Theme:
+    def __init__(self, name):
+        self.name = resolve_theme(name)
+        self.p = THEMES[self.name]
+
+    def c(self, key, s):
+        if not COLOR:
+            return s
+        return f"\033[38;5;{self.p[key]}m{s}\033[0m"
+
+    def bar(self, pct, width):
+        pct = max(0.0, min(100.0, float(pct or 0)))
+        filled = int(round(width * pct / 100.0))
+        if not COLOR:
+            return "█" * filled + "░" * (width - filled)
+        pal = self.p["palette"]
+        cells = []
+        for i in range(filled):
+            col = pal[min(len(pal) - 1, (i * len(pal)) // max(1, filled))]
+            cells.append(f"\033[38;5;{col}m█")
+        cells.append(f"\033[38;5;{self.p['dim']}m" + "░" * (width - filled))
+        return "".join(cells) + "\033[0m"
+
+
+def pct_color(pct):
+    return "green" if pct < 50 else "yellow" if pct < 80 else "red"
+
+
+def temp_color(t):
+    return "green" if t < 60 else "yellow" if t < 78 else "red"
+
+
+SPARK_CHARS = "▁▂▃▄▅▆▇█"
+BRAILLE_BITS = ((0x01, 0x02, 0x04, 0x40), (0x08, 0x10, 0x20, 0x80))
+
+
+def sparkline(values, t, color="accent", width=None):
+    vals = list(values)
+    if width:
+        vals = vals[-width:]
+    if not vals:
+        return t.c("dim", "·")
+    lo, hi = min(vals), max(vals)
+    if hi - lo < 1e-9:
+        flat = SPARK_CHARS[0] * len(vals)
+        return t.c("dim" if color == "gradient" else color, flat)
+    pal = t.p["palette"]
+    if not COLOR:
+        return "".join(SPARK_CHARS[int((v - lo) / (hi - lo) * 7)] for v in vals)
+    out = []
+    for v in vals:
+        k = (v - lo) / (hi - lo)
+        ch = SPARK_CHARS[int(k * 7)]
+        if color == "gradient":
+            ci = min(len(pal) - 1, int(k * (len(pal) - 1)))
+            out.append(f"\033[38;5;{pal[ci]}m{ch}")
+        else:
+            out.append(ch)
+    if color == "gradient":
+        return "".join(out) + "\033[0m"
+    return t.c(color, "".join(out))
+
+
+def braille_graph(values, width, rows, t):
+    """Многострочный график точками Брайля (2×4 точки на символ)."""
+    width = max(4, int(width))
+    rows = max(1, int(rows))
+    src = list(values)
+    if not src:
+        return [t.c("dim", " " * width) for _ in range(rows)]
+    if len(src) == 1:
+        src = src * 2
+    n = width * 2
+    pts = []
+    for i in range(n):
+        x = (i / (n - 1)) * (len(src) - 1) if n > 1 else 0
+        i0 = int(x)
+        i1 = min(len(src) - 1, i0 + 1)
+        fr = x - i0
+        pts.append(src[i0] * (1 - fr) + src[i1] * fr)
+    lo, hi = min(pts), max(pts)
+    if hi - lo < 1e-9:
+        hi = lo + 1
+    dots = rows * 4
+    cells = [[0] * width for _ in range(rows)]
+    for xi, v in enumerate(pts):
+        cx = xi // 2
+        level = int((v - lo) / (hi - lo) * (dots - 1))
+        for dy in (level - 1, level):
+            if dy < 0:
+                continue
+            cy = rows - 1 - (dy // 4)
+            if cy < 0:
+                continue
+            cells[cy][cx] |= BRAILLE_BITS[xi % 2][dy % 4]
+    pal = t.p["palette"]
+    out = []
+    for ri, row in enumerate(cells):
+        frac = (rows - 1 - ri) / max(1, rows - 1) if rows > 1 else 1.0
+        ci = min(len(pal) - 1, int(frac * (len(pal) - 1)))
+        line = "".join(chr(0x2800 + b) if b else " " for b in row)
+        if not COLOR:
+            out.append(line)
+        else:
+            out.append(f"\033[38;5;{pal[ci]}m{line}\033[0m")
+    return out
+
+
+# ───────────────────────────── форматирование ─────────────────────────────
+def fmt_tokens(n):
+    n = int(n or 0)
+    if n >= 1_000_000_000:
+        return f"{n / 1e9:.1f}B"
+    if n >= 1_000_000:
+        return f"{n / 1e6:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1e3:.1f}K"
+    return str(n)
+
+
+def fmt_bytes(n):
+    n = float(n or 0)
+    for unit in ("B", "K", "M", "G", "T"):
+        if n < 1024:
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}P"
+
+
+def human_left(seconds):
+    seconds = int(seconds)
+    if seconds < 0:
+        return "0м"
+    d, rem = divmod(seconds, 86400)
+    h, rem = divmod(rem, 3600)
+    m = rem // 60
+    if d:
+        return f"{d}д {h}ч"
+    if h:
+        return f"{h}ч {m:02d}м"
+    return f"{m}м"
+
+
+def read_int(path, default=None):
+    try:
+        return int(Path(path).read_text().strip())
+    except Exception:
+        return default
+
+
+def _as_int(value, default, lo=None, hi=None):
+    try:
+        v = int(value)
+    except Exception:
+        return default
+    if lo is not None:
+        v = max(lo, v)
+    if hi is not None:
+        v = min(hi, v)
+    return v
+
+
+def _as_float(value, default, lo=None, hi=None):
+    try:
+        v = float(value)
+    except Exception:
+        return default
+    if lo is not None:
+        v = max(lo, v)
+    if hi is not None:
+        v = min(hi, v)
+    return v
+
+
+def _as_bool(value, default=False):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on", "да")
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return default
+
+
+def _show_cfg(cfg):
+    s = cfg.get("show")
+    return s if isinstance(s, dict) else {}
+
+
+def disk_usage_root():
+    try:
+        return shutil.disk_usage("/")
+    except Exception:
+        return None
+
+
+def clear_cache():
+    # лимиты Claude не трогаем: при 429 останется последний удачный ответ
+    for f in (CLAUDE_CACHE, TAIL_CACHE):
+        try:
+            f.unlink()
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+
+
+# ───────────────────────────── Claude ─────────────────────────────
+def claude_limits(ttl=TTL_LIMITS, force=False):
+    if not force and USAGE_CACHE.exists():
+        try:
+            if time.time() - USAGE_CACHE.stat().st_mtime < ttl:
+                return json.loads(USAGE_CACHE.read_text())
+        except Exception:
+            pass
+
+    token = None
+    try:
+        cred = json.loads((HOME / ".claude/.credentials.json").read_text())
+        token = (cred.get("claudeAiOauth") or {}).get("accessToken")
+    except Exception:
+        pass
+    if not token:
+        return {"error": "нет токена Claude Code — запустите claude"}
+
+    req = urllib.request.Request(
+        "https://api.anthropic.com/api/oauth/usage",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "anthropic-beta": "oauth-2025-04-20",
+            "User-Agent": f"agentop/{VERSION}",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=4) as r:
+            data = json.loads(r.read().decode())
+        tmp = USAGE_CACHE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data))
+        os.chmod(tmp, 0o600)
+        tmp.replace(USAGE_CACHE)
+        return data
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            # не долбим API: продлеваем жизнь кэша и отдаём его молча
+            if USAGE_CACHE.exists():
+                try:
+                    os.utime(USAGE_CACHE, None)
+                    return json.loads(USAGE_CACHE.read_text())
+                except Exception:
+                    pass
+            return {"error": "Claude API: 429, попробуйте позже"}
+        err = f"HTTP {e.code}"
+    except Exception as e:
+        err = e.__class__.__name__
+
+    if USAGE_CACHE.exists():
+        try:
+            data = json.loads(USAGE_CACHE.read_text())
+            data["_stale"] = True
+            return data
+        except Exception:
+            pass
+    return {"error": err}
+
+
+def claude_today(ttl=TTL_CLAUDE):
+    today = datetime.now().astimezone().date().isoformat()
+    if CLAUDE_CACHE.exists():
+        try:
+            c = json.loads(CLAUDE_CACHE.read_text())
+            if c.get("date") == today and time.time() - c.get("ts", 0) < ttl:
+                return c
+        except Exception:
+            pass
+
+    midnight = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+    start = midnight.timestamp()
+    seen = set()
+    totals = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "messages": 0}
+    models = {}
+
+    for path in glob.glob(str(HOME / ".claude/projects/**/*.jsonl"), recursive=True):
+        try:
+            if os.path.getmtime(path) < start:
+                continue
+        except OSError:
+            continue
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if '"usage"' not in line:
+                        continue
+                    try:
+                        d = json.loads(line)
+                    except Exception:
+                        continue
+                    if d.get("type") != "assistant":
+                        continue
+                    msg = d.get("message") or {}
+                    u = msg.get("usage")
+                    if not u:
+                        continue
+                    try:
+                        ts = datetime.fromisoformat(d["timestamp"].replace("Z", "+00:00")).timestamp()
+                    except Exception:
+                        continue
+                    if ts < start:
+                        continue
+                    key = (d.get("requestId") or "", msg.get("id") or d.get("uuid"))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    vals = {
+                        "input": int(u.get("input_tokens") or 0),
+                        "output": int(u.get("output_tokens") or 0),
+                        "cache_read": int(u.get("cache_read_input_tokens") or 0),
+                        "cache_write": int(u.get("cache_creation_input_tokens") or 0),
+                    }
+                    totals["messages"] += 1
+                    for k, v in vals.items():
+                        totals[k] += v
+                    m = msg.get("model") or "?"
+                    mm = models.setdefault(m, {"input": 0, "output": 0,
+                                               "cache_read": 0, "cache_write": 0})
+                    for k, v in vals.items():
+                        mm[k] += v
+        except Exception:
+            continue
+
+    res = {"date": today, "ts": time.time(), "totals": totals, "models": models}
+    try:
+        tmp = CLAUDE_CACHE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(res))
+        os.chmod(tmp, 0o600)
+        tmp.replace(CLAUDE_CACHE)
+    except Exception:
+        pass
+    return res
+
+
+class ClaudeTail:
+    """Инкрементальный хвост логов Claude — события (ts, output_tokens, model)."""
+
+    def __init__(self, window=1800):
+        self.window = window
+        self.offset = {}
+        self.seen = set()
+        self.events = []
+        self.last = 0.0
+        self.last_save = 0.0
+        self._load()
+
+    def _load(self):
+        try:
+            d = json.loads(TAIL_CACHE.read_text())
+            if time.time() - d.get("ts", 0) < 86400:
+                self.offset = {k: int(v) for k, v in (d.get("offset") or {}).items()}
+                self.events = [(float(a), int(b), c) for a, b, c in (d.get("events") or [])]
+        except Exception:
+            pass
+
+    def _save(self):
+        try:
+            tmp = TAIL_CACHE.with_suffix(".tmp")
+            tmp.write_text(json.dumps({
+                "ts": time.time(),
+                "offset": self.offset,
+                "events": self.events[-5000:],
+            }))
+            os.chmod(tmp, 0o600)
+            tmp.replace(TAIL_CACHE)
+            self.last_save = time.time()
+        except Exception:
+            pass
+
+    def poll(self, force=False):
+        now = time.time()
+        if not force and now - self.last < 10:
+            return
+        self.last = now
+
+        for path in glob.glob(str(HOME / ".claude/projects/**/*.jsonl"), recursive=True):
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                continue
+            off = self.offset.get(path, 0)
+            if size < off:
+                off = 0
+            try:
+                old_mtime = os.path.getmtime(path)
+            except OSError:
+                continue
+            if path not in self.offset and size and old_mtime < now - self.window:
+                # старый файл: не читаем историю, начинаем с конца
+                self.offset[path] = size
+                continue
+            try:
+                with open(path, "rb") as f:
+                    f.seek(off)
+                    raw = f.read()
+            except OSError:
+                continue
+            if not raw:
+                self.offset[path] = off
+                continue
+            chunks = raw.split(b"\n")[:-1]
+            self.offset[path] = off + sum(len(c) + 1 for c in chunks)
+            for chunk in chunks:
+                if b'"usage"' not in chunk:
+                    continue
+                try:
+                    d = json.loads(chunk)
+                except Exception:
+                    continue
+                if d.get("type") != "assistant":
+                    continue
+                msg = d.get("message") or {}
+                u = msg.get("usage") or {}
+                if not u:
+                    continue
+                try:
+                    ts = datetime.fromisoformat(d["timestamp"].replace("Z", "+00:00")).timestamp()
+                except Exception:
+                    continue
+                key = (d.get("requestId") or "", msg.get("id") or d.get("uuid"))
+                if key in self.seen:
+                    continue
+                self.seen.add(key)
+                self.events.append((ts, int(u.get("output_tokens") or 0), msg.get("model") or "?"))
+
+        if len(self.seen) > 200_000:
+            self.seen.clear()
+        cutoff = time.time() - self.window
+        self.events = [e for e in self.events if e[0] >= cutoff]
+        if now - self.last_save > 30:
+            self._save()
+
+
+class Speed:
+    def __init__(self, window=1800):
+        self.window = window
+        self.claude = ClaudeTail(window)
+        self.oc = []
+
+    def update(self, force=False):
+        self.claude.poll(force=force)
+        self.oc = opencode_events(self.window)
+
+    def events(self):
+        return self.claude.events + self.oc
+
+    def rate(self, seconds):
+        if seconds <= 0:
+            return 0.0
+        now = time.time()
+        total = sum(tok for ts, tok, _ in self.events() if ts >= now - seconds)
+        return total / seconds
+
+    def buckets(self, total=None, n=30):
+        total = total or self.window
+        now = time.time()
+        step = total / n
+        out = [0] * n
+        for ts, tok, _ in self.events():
+            if ts < now - total:
+                continue
+            ci = int((ts - (now - total)) // step)
+            if ci < 0:
+                continue
+            idx = min(n - 1, ci)
+            out[idx] += tok
+        return out
+
+    def peak(self, bucket=60, total=900):
+        b = self.buckets(total, max(1, total // bucket))
+        return max(b) / bucket if b else 0.0
+
+    def snapshot(self):
+        """Кэш метрик на 0.5 с, чтобы отрисовка не пересчитывала их слишком часто."""
+        now = time.time()
+        if getattr(self, "_snap", None) is not None and now - self._snap_ts < 0.5:
+            return self._snap
+        self._snap = {
+            "now": self.rate(30),
+            "avg1": self.rate(60),
+            "avg5": self.rate(300),
+            "peak": self.peak(60, 900),
+            "buckets": self.buckets(900, 30),
+        }
+        self._snap_ts = now
+        return self._snap
+
+
+# ───────────────────────────── opencode ─────────────────────────────
+def _oc_db():
+    return HOME / ".local/share/opencode/opencode.db"
+
+
+def opencode_events(window=1800):
+    db = _oc_db()
+    if not db.exists():
+        return []
+    start = int((time.time() - window) * 1000)
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=3)
+        rows = con.execute(
+            "select time_created, data from session_message "
+            "where type='assistant' and time_created>=?",
+            (start,),
+        ).fetchall()
+        con.close()
+    except Exception:
+        return []
+    out = []
+    for ts, data in rows:
+        try:
+            d = json.loads(data)
+        except Exception:
+            continue
+        tk = d.get("tokens") or {}
+        tok = int(tk.get("output") or 0) + int(tk.get("reasoning") or 0)
+        if tok:
+            out.append((ts / 1000.0, tok, (d.get("model") or {}).get("id") or "?"))
+    return out
+
+
+def opencode_stats():
+    db = _oc_db()
+    if not db.exists():
+        return None
+    midnight = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+    start_ms = int(midnight.timestamp() * 1000)
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=3)
+        rows = con.execute(
+            "select data from session_message where type='assistant' and time_created>=?",
+            (start_ms,),
+        ).fetchall()
+        all_cost = con.execute(
+            "select coalesce(sum(json_extract(data,'$.cost')),0) "
+            "from session_message where type='assistant'"
+        ).fetchone()[0]
+        con.close()
+    except Exception:
+        return None
+
+    today = {"cost": 0.0, "input": 0, "output": 0, "reasoning": 0,
+             "cache_read": 0, "cache_write": 0, "messages": 0}
+    models = {}
+    for (data,) in rows:
+        try:
+            d = json.loads(data)
+        except Exception:
+            continue
+        tk = d.get("tokens")
+        if not tk:
+            continue
+        today["messages"] += 1
+        today["cost"] += float(d.get("cost") or 0)
+        today["input"] += int(tk.get("input") or 0)
+        today["output"] += int(tk.get("output") or 0)
+        today["reasoning"] += int(tk.get("reasoning") or 0)
+        cache = tk.get("cache") or {}
+        today["cache_read"] += int(cache.get("read") or 0)
+        today["cache_write"] += int(cache.get("write") or 0)
+        mid = (d.get("model") or {}).get("id") or "?"
+        m = models.setdefault(mid, {"cost": 0.0, "input": 0, "output": 0,
+                                    "reasoning": 0, "cache_read": 0})
+        m["cost"] += float(d.get("cost") or 0)
+        m["input"] += int(tk.get("input") or 0)
+        m["output"] += int(tk.get("output") or 0)
+        m["reasoning"] += int(tk.get("reasoning") or 0)
+        m["cache_read"] += int(cache.get("read") or 0)
+    return {"today": today, "models": models, "all_cost": float(all_cost or 0)}
+
+
+# ───────────────────────────── железо ─────────────────────────────
+class Cpu:
+    def __init__(self):
+        self.prev = self._read()
+
+    @staticmethod
+    def _read():
+        out = []
+        try:
+            for line in Path("/proc/stat").read_text().splitlines():
+                if not line.startswith("cpu"):
+                    continue
+                parts = line.split()
+                name = parts[0]
+                vals = [int(x) for x in parts[1:]]
+                idle = vals[3] + (vals[4] if len(vals) > 4 else 0)
+                out.append((name, sum(vals), idle))
+        except Exception:
+            pass
+        return out
+
+    def pcts(self):
+        cur = self._read()
+        out = []
+        for (name, total, idle), (_, pt, pi) in zip(cur, self.prev):
+            dt = total - pt
+            di = idle - pi
+            out.append((name, None if dt <= 0 else max(0.0, min(100.0, 100.0 * (1 - di / dt)))))
+        self.prev = cur
+        return out
+
+
+class DiskIO:
+    def __init__(self):
+        self.dev = self._root_disk()
+        self.prev = self._read()
+        self.last = time.time()
+
+    @staticmethod
+    def _root_disk():
+        try:
+            for line in Path("/proc/mounts").read_text().splitlines():
+                p = line.split()
+                if p[1] == "/":
+                    name = os.path.basename(p[0])
+                    m = re.match(r"^(nvme\d+n\d+|mmcblk\d+)p\d+$", name)
+                    if m:
+                        return m.group(1)
+                    return re.sub(r"\d+$", "", name) or name
+        except Exception:
+            pass
+        return "nvme0n1"
+
+    def _read(self):
+        try:
+            for line in Path("/proc/diskstats").read_text().splitlines():
+                p = line.split()
+                if len(p) > 9 and p[2] == self.dev:
+                    return int(p[5]), int(p[9])
+        except Exception:
+            pass
+        return 0, 0
+
+    def rates(self):
+        cur = self._read()
+        now = time.time()
+        dt = max(0.001, now - self.last)
+        r = (cur[0] - self.prev[0]) * 512 / dt if cur[0] >= self.prev[0] else 0
+        w = (cur[1] - self.prev[1]) * 512 / dt if cur[1] >= self.prev[1] else 0
+        self.prev = cur
+        self.last = now
+        return r, w
+
+
+class NetIO:
+    def __init__(self):
+        self.iface = self._default_iface()
+        self.prev = self._read() or (0, 0)
+        self.last = time.time()
+        self.last_check = self.last
+
+    @staticmethod
+    def _default_iface():
+        # без вызова ip: читаем /proc/net/route
+        try:
+            with open("/proc/net/route") as f:
+                next(f, None)
+                for line in f:
+                    p = line.split()
+                    if len(p) > 7 and p[1] == "00000000" and p[7] == "00000000":
+                        return p[0]
+        except Exception:
+            pass
+        for d in sorted(glob.glob("/sys/class/net/*")):
+            n = os.path.basename(d)
+            if n != "lo" and os.path.exists(d + "/statistics/rx_bytes"):
+                return n
+        return "lo"
+
+    def _read(self):
+        try:
+            base = f"/sys/class/net/{self.iface}/statistics"
+            return (int(Path(base, "rx_bytes").read_text()),
+                    int(Path(base, "tx_bytes").read_text()))
+        except Exception:
+            return None
+
+    def _switch_iface(self):
+        new = self._default_iface()
+        if new != self.iface:
+            self.iface = new
+            self.prev = self._read() or (0, 0)
+            self.last = time.time()
+            return True
+        return False
+
+    def rates(self):
+        now = time.time()
+        if now - self.last_check >= 60:
+            self.last_check = now
+            if self._switch_iface():
+                return 0.0, 0.0
+        cur = self._read()
+        if cur is None:
+            if self._switch_iface():
+                return 0.0, 0.0
+            cur = (0, 0)
+        dt = max(0.001, now - self.last)
+        r = max(0, cur[0] - self.prev[0]) / dt
+        t = max(0, cur[1] - self.prev[1]) / dt
+        self.prev = cur
+        self.last = now
+        return r, t
+
+
+class Battery:
+    def __init__(self):
+        self.base = None
+        for p in sorted(Path("/sys/class/power_supply").glob("BAT*")):
+            if (p / "capacity").exists():
+                self.base = p
+                break
+        self.ac_path = None
+        for p in sorted(Path("/sys/class/power_supply").glob("*")):
+            try:
+                if (p / "type").read_text().strip() in ("Mains", "USB", "USB_C"):
+                    self.ac_path = p / "online"
+                    break
+            except Exception:
+                continue
+
+    def read(self):
+        base = self.base
+        if base is None:
+            return None
+        cap = read_int(base / "capacity")
+        status = ""
+        try:
+            status = (base / "status").read_text().strip()
+        except Exception:
+            pass
+        ac = bool(read_int(self.ac_path, 0)) if self.ac_path else False
+        power = read_int(base / "power_now")
+        energy = read_int(base / "energy_now")
+        full = read_int(base / "energy_full")
+        if energy is None:
+            # некоторые ноутбуки отдают charge_now (µAh) и voltage_now (µV)
+            charge = read_int(base / "charge_now")
+            voltage = read_int(base / "voltage_now")
+            if charge is not None and voltage is not None:
+                energy = int(charge * voltage / 1e6)
+                full = int((read_int(base / "charge_full") or 0) * voltage / 1e6)
+        if power is None:
+            current = read_int(base / "current_now")
+            voltage = read_int(base / "voltage_now")
+            if current is not None and voltage is not None:
+                power = int(abs(current) * voltage / 1e6)
+        return {"cap": cap, "status": status, "ac": ac,
+                "power": power, "energy": energy, "full": full}
+
+
+def meminfo():
+    d = {}
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            k, v = line.split(":", 1)
+            d[k] = int(v.split()[0])
+    except Exception:
+        return None
+    total = d.get("MemTotal", 0) / 1048576
+    avail = d.get("MemAvailable", 0) / 1048576
+    st = d.get("SwapTotal", 0) / 1048576
+    sf = d.get("SwapFree", 0) / 1048576
+    return total, total - avail, st, st - sf
+
+
+def temperature():
+    for name in ("k10temp", "amdgpu", "acpitz"):
+        for h in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+            try:
+                if Path(h, "name").read_text().strip() != name:
+                    continue
+            except Exception:
+                continue
+            t = read_int(Path(h, "temp1_input"))
+            if t and t > 0:
+                return t / 1000.0
+    return None
+
+
+def gpu_busy():
+    for f in sorted(glob.glob("/sys/class/drm/card*/device/gpu_busy_percent")):
+        v = read_int(f)
+        if v is not None:
+            return v
+    return None
+
+
+def gpu_temp():
+    for h in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+        try:
+            if Path(h, "name").read_text().strip() == "amdgpu":
+                t = read_int(Path(h, "temp1_input"))
+                if t:
+                    return t / 1000.0
+        except Exception:
+            continue
+    return None
+
+
+def top_procs(n=5):
+    try:
+        out = subprocess.run(
+            ["ps", "-eo", "pid=,pcpu=,pmem=,comm=", "--sort=-pcpu"],
+            capture_output=True, text=True, timeout=2,
+        ).stdout
+    except Exception:
+        return []
+    res = []
+    skip = {os.getpid(), os.getppid()}
+    for line in out.splitlines():
+        p = line.split(None, 3)
+        if len(p) < 4:
+            continue
+        try:
+            pid = int(p[0])
+        except ValueError:
+            continue
+        if pid in skip or p[3] in ("ps", "agentop"):
+            continue
+        res.append((float(p[1]), float(p[2]), p[3]))
+        if len(res) >= n:
+            break
+    return res
+
+
+def uptime():
+    try:
+        return float(Path("/proc/uptime").read_text().split()[0])
+    except Exception:
+        return 0.0
+
+
+# ───────────────────────────── секции ─────────────────────────────
+def frame_top(t, W, left, right):
+    prefix = t.c("dim", "╭─ ")
+    suffix = t.c("dim", " ─╮")
+    gap = W - 8 - vlen(left) - vlen(right)
+    if gap < 1:
+        return t.c("dim", clip("╭─ " + left + " " + right + " ─╮", W))
+    return prefix + left + " " + t.c("dim", "─" * gap) + " " + right + suffix
+
+
+def frame_bottom(t, W, hint):
+    prefix = t.c("dim", "╰─ ")
+    suffix = t.c("dim", "─╯")
+    gap = W - 6 - vlen(hint)
+    if gap < 1:
+        return t.c("dim", clip("╰─ " + hint + "─╯", W))
+    return prefix + hint + " " + t.c("dim", "─" * gap) + suffix
+
+
+def head(t, w, title):
+    s = t.c("accent", "▐ ") + t.c("text", title) + " "
+    fill = w - vlen(s)
+    return s + (t.c("dim", "─" * fill) if fill > 0 else "")
+
+
+def key(t, k):
+    return t.c("accent", f"[{k}]")
+
+
+def content_line(t, W, s):
+    inner = W - 4
+    return t.c("dim", "│ ") + pad(clip(s, inner), inner) + t.c("dim", " │")
+
+
+def limits_lines(lim, t, W, decimals=3):
+    lines = []
+    if not lim or lim.get("error"):
+        return [f"  {t.c('red', '⚠')} {t.c('dim', (lim or {}).get('error', 'нет данных'))}"]
+    if lim.get("_stale"):
+        lines.append(f"  {t.c('dim', '(кэш — сеть недоступна)')}")
+    bw = 20 if W >= 60 else 12 if W >= 48 else 9
+    show_left = W >= 56
+    show_pace = W >= 60
+    warn = []
+    fmt_pct = lambda v: f"{float(v):.{decimals}f}%"
+    for label, key, wlen in (("5h", "five_hour", 5 * 3600), ("7d", "seven_day", 7 * 86400)):
+        o = lim.get(key) or {}
+        used = o.get("utilization")
+        if used is None:
+            lines.append(f"  {t.c('text', label)}  {t.c('dim', 'нет данных')}")
+            continue
+        used = float(used)
+        left = max(0.0, 100.0 - used)
+        rem = None
+        pace = None
+        if o.get("resets_at"):
+            try:
+                reset = datetime.fromisoformat(o["resets_at"].replace("Z", "+00:00")).timestamp()
+                rem = reset - time.time()
+                elapsed = wlen - rem
+                if elapsed > 60:
+                    pace = used * wlen / elapsed
+            except Exception:
+                pass
+        col = pct_color(used)
+        line = f"  {t.c('text', label)}  {t.bar(used, bw)} {t.c(col, fmt_pct(used))}"
+        if show_left:
+            line += f"  {t.c('dim', 'left')} {t.c(col, fmt_pct(left))}"
+        if rem is not None:
+            line += f"  {t.c('dim', '↻')} {human_left(rem)}"
+        if show_pace and pace is not None and used < 99.5:
+            pcol = "red" if pace >= 105 else "yellow" if pace >= 85 else "dim"
+            line += f"  {t.c('dim', 'pace')} {t.c(pcol, f'{pace:.1f}%')}"
+        if used >= 99.5:
+            warn.append(f"{label} лимит исчерпан" + (f", сброс через {human_left(rem)}" if rem and rem > 0 else ""))
+        elif pace and pace >= 105 and rem and rem > 0:
+            elapsed = wlen - rem
+            rate = used / max(1, elapsed)
+            warn.append(f"{label} хватит на {human_left((100 - used) / max(1e-9, rate))}")
+        lines.append(line)
+    if warn:
+        lines.append(f"  {t.c('red', '⚠')} {t.c('red', ' · '.join(warn))}")
+    return lines
+
+
+def tokens_lines(cl, oc, t, W):
+    ctot = (cl or {}).get("totals") or {}
+    otot = (oc or {}).get("today") or {}
+    lines = []
+    cr = ctot.get("cache_read", 0)
+    cw = ctot.get("cache_write", 0)
+    inp = ctot.get("input", 0)
+    out = ctot.get("output", 0)
+    hit = (cr / (cr + cw + inp) * 100) if (cr + cw + inp) else 0
+
+    if W >= 66:
+        lines.append(
+            f"  {t.c('accent', 'Claude')}   in {t.c('text', fmt_tokens(inp))}  "
+            f"out {t.c('text', fmt_tokens(out))}  "
+            f"cache {t.c('text', fmt_tokens(cr + cw))}  "
+            f"{t.c('dim', str(ctot.get('messages', 0)) + ' msg')}  "
+            f"{t.c('dim', 'hit')} {t.c('green', f'{hit:.1f}%')}"
+        )
+    else:
+        lines.append(
+            f"  {t.c('accent', 'Claude')}   {t.c('text', fmt_tokens(inp))} in · "
+            f"{t.c('text', fmt_tokens(out))} out · "
+            f"{t.c('text', fmt_tokens(cr + cw))} cache"
+        )
+    if oc:
+        cost = float(otot.get("cost") or 0.0)
+        midnight = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+        hours = max(0.05, (time.time() - midnight.timestamp()) / 3600)
+        burn = cost / hours
+        out_total = otot.get("output", 0) + otot.get("reasoning", 0)
+        all_cost = float(oc.get("all_cost") or 0.0)
+        if W >= 66:
+            lines.append(
+                f"  {t.c('blue', 'opencode')} in {t.c('text', fmt_tokens(otot.get('input')))}  "
+                f"out {t.c('text', fmt_tokens(out_total))}  "
+                f"cache {t.c('text', fmt_tokens(otot.get('cache_read')))}  "
+                f"{t.c('green', f'${cost:.3f}')}  "
+                f"{t.c('dim', f'${burn:.2f}/ч · ${all_cost:.2f}')}"
+            )
+        else:
+            lines.append(
+                f"  {t.c('blue', 'opencode')} {t.c('text', fmt_tokens(otot.get('input')))} in · "
+                f"{t.c('text', fmt_tokens(out_total))} out · "
+                f"{t.c('green', f'${cost:.3f}')}"
+            )
+    else:
+        lines.append(f"  {t.c('blue', 'opencode')} {t.c('dim', 'нет данных')}")
+    return lines
+
+
+def speed_lines(speed, t, W, big=False):
+    ev = speed.events()
+    if not ev:
+        return [f"  {t.c('dim', 'нет активности за последние 15 мин')}"]
+    s = speed.snapshot()
+    now = s["now"]
+    col = "green" if now > 0 else "dim"
+    if W >= 60:
+        l1 = (f"  {t.c('dim', 'now')} {t.c(col, f'{now:6.2f}')} {t.c('dim', 'tok/s')}   "
+              f"{t.c('dim', '1m')} {s['avg1']:5.2f}   {t.c('dim', '5m')} {s['avg5']:5.2f}   "
+              f"{t.c('dim', 'peak')} {s['peak']:5.2f}")
+    else:
+        l1 = (f"  {t.c('dim', 'now')} {t.c(col, f'{now:6.2f}')} {t.c('dim', 'tok/s')}  "
+              f"{t.c('dim', 'peak')} {s['peak']:5.2f}")
+    if big:
+        graph = braille_graph(s["buckets"], max(10, W - 6), 3, t)
+        return [l1] + ["  " + g for g in graph]
+    l2 = "  " + sparkline(s["buckets"], t, "gradient")
+    if W >= 50:
+        l2 += t.c("dim", "  tok/30s · 15m")
+    return [l1, l2]
+
+
+def cpu_lines(pcts, load, hist_cpu, hist_load, t, W, per_core=True):
+    total = next((p for n, p in pcts if n == "cpu"), 0.0) or 0.0
+    bw = 20 if W >= 60 else 12
+    show_spark = W >= 50
+    line = f"  {t.c('text', 'total')} {t.bar(total, bw)} {t.c(pct_color(total), f'{total:3.0f}%')}"
+    if W >= 60:
+        line += f"  {t.c('dim', f'{os.cpu_count() or 0} cores')}"
+    if show_spark:
+        line += f"  {sparkline(hist_cpu, t, 'gradient')}"
+    lines = [line]
+    if per_core:
+        cores = [(n, p) for n, p in pcts if n != "cpu"]
+        per_row = 4 if W >= 66 else 3 if W >= 48 else 2
+        cbar = 5 if W >= 48 else 3
+        for i in range(0, len(cores), per_row):
+            row = "  "
+            for name, p in cores[i:i + per_row]:
+                p = p or 0.0
+                label = name.replace("cpu", "C")
+                row += (f"{t.c('dim', label)} {t.bar(p, cbar)} "
+                        f"{t.c(pct_color(p), f'{p:3.0f}')}  ")
+            lines.append(row.rstrip())
+    load_line = f"  {t.c('dim', 'load')} {load[0]:.2f} {load[1]:.2f} {load[2]:.2f}"
+    if show_spark:
+        load_line += f"  {sparkline(hist_load, t, 'gradient')}"
+    lines.append(load_line)
+    return lines
+
+
+def mem_lines(mem, temp, gpu, gt, hist_temp, t, W):
+    lines = []
+    bw = 16 if W >= 52 else 10
+    show_spark = W >= 50
+    if mem:
+        total, used, st, su = mem
+        pct = (used / total * 100) if total else 0
+        line = (f"  {t.c('text', 'RAM')}  {t.bar(pct, bw)} {t.c(pct_color(pct), f'{pct:3.0f}%')}  "
+                f"{used:.1f}/{total:.1f}G")
+        if W >= 48:
+            line += f"   {t.c('dim', 'swap')} {su:.1f}/{st:.1f}G"
+        lines.append(line)
+    if temp:
+        tp = max(0.0, min(100.0, (temp - 30) / 60 * 100))
+        line = f"  {t.c('text', 'temp')} {t.bar(tp, bw)} {t.c(temp_color(temp), f'{temp:3.0f}°C')}"
+        if show_spark:
+            line += f"  {sparkline(hist_temp, t, 'gradient')}"
+        lines.append(line)
+    if gpu is not None:
+        extra = f"  {t.c('dim', 'gpu')} {gt:.0f}°C" if gt else ""
+        lines.append(f"  {t.c('text', 'GPU')}  {t.bar(gpu, bw)} "
+                     f"{t.c(pct_color(gpu), f'{gpu:3.0f}%')}{extra}")
+    return lines
+
+
+def power_lines(bat, t, W):
+    if not bat or bat.get("cap") is None:
+        return [f"  {t.c('dim', 'батарея не найдена')}"]
+    cap = bat["cap"]
+    col = "green" if cap > 40 else "yellow" if cap > 15 else "red"
+    state_raw = bat.get("status") or "?"
+    status_map = {"Charging": "зарядка", "Discharging": "разряд", "Full": "полный",
+                  "Not charging": "не заряжается"}
+    state = "AC" if bat.get("ac") else status_map.get(state_raw, state_raw)
+    line = (f"  {t.c('text', 'BAT')} {t.bar(cap, 16)} {t.c(col, f'{cap:3.0f}%')}  "
+            f"{t.c('dim', state)}")
+    power = abs(bat["power"]) if bat.get("power") else 0
+    if power and bat.get("energy") is not None and W >= 52:
+        w = power / 1e6
+        line += f"  {t.c('text', f'{w:.1f}W')}"
+        if bat.get("ac") and bat.get("full") and bat["full"] > bat["energy"]:
+            line += f"  {t.c('dim', 'full in')} {human_left((bat['full'] - bat['energy']) / power * 3600)}"
+        elif not bat.get("ac"):
+            line += f"  {t.c('dim', 'left')} {human_left(bat['energy'] / power * 3600)}"
+    return [line]
+
+
+def io_lines(disk, net, root_usage, iface, hist_io, t, W):
+    lines = []
+    show_spark = W >= 50
+    if disk and root_usage:
+        total, used, _ = root_usage
+        pct = used / total * 100 if total else 0
+        r, w = disk
+        line = (f"  {t.c('text', 'disk')} {t.bar(pct, 12)} {t.c('dim', f'{used / 2**30:.0f}/{total / 2**30:.0f}G')}"
+                f"  {t.c('dim', 'r')} {t.c('text', fmt_bytes(r))}/s"
+                f"  {t.c('dim', 'w')} {t.c('text', fmt_bytes(w))}/s")
+        if show_spark:
+            line += f"  {sparkline(hist_io, t, 'gradient')}"
+        lines.append(line)
+    if net:
+        rx, tx = net
+        lines.append(
+            f"  {t.c('text', 'net')}  {t.c('green', '↓')} {t.c('text', fmt_bytes(rx))}/s"
+            f"  {t.c('blue', '↑')} {t.c('text', fmt_bytes(tx))}/s"
+            f"  {t.c('dim', iface)}"
+        )
+    return lines
+
+
+def proc_lines(procs, t, W):
+    if not procs:
+        return [f"  {t.c('dim', 'нет данных')}"]
+    if W < 60:
+        procs = procs[:3]
+        row = "  " + "  ".join(
+            f"{t.c('text', name[:8])} {t.c(pct_color(cpu), f'{cpu:3.0f}%')}"
+            for cpu, _mem, name in procs
+        )
+        return [row]
+    row = "  "
+    for cpu, mem, name in procs:
+        row += (f"{t.c('text', name[:16])} {t.c(pct_color(cpu), f'{cpu:3.0f}%')}"
+                f"{t.c('dim', f'/{mem:.0f}%')}  ")
+    return [row.rstrip()]
+
+
+# ───────────────────────────── приложение ─────────────────────────────
+class App:
+    def __init__(self, cfg, threaded=True):
+        self.cfg = cfg
+        self.cpu = Cpu()
+        self.disk = DiskIO()
+        self.net = NetIO()
+        self.bat = Battery()
+        self.speed = Speed(1800)
+        self.force_limits = False
+        self.ts = {}
+        self.cache = {}
+        self.last_hist = 0.0
+        self.version = 0
+        n = _as_int(cfg.get("history"), 120, 10, 5000)
+        self.h_cpu = deque(maxlen=n)
+        self.h_load = deque(maxlen=n)
+        self.h_temp = deque(maxlen=n)
+        self.h_io = deque(maxlen=n)
+        self.theme = Theme(cfg.get("theme", "auto"))
+        if threaded:
+            self._limits_thread = threading.Thread(target=self._limits_worker, daemon=True)
+            self._limits_thread.start()
+        else:
+            self._limits_thread = None
+
+    def _limits_worker(self):
+        # фоновое обновление лимитов — не блокирует интерфейс
+        while True:
+            try:
+                data = claude_limits(force=True)
+                if data and not data.get("error"):
+                    self.cache["limits"] = data
+                    self.ts["limits"] = time.time()
+            except Exception:
+                pass
+            time.sleep(TTL_LIMITS)
+
+    def _due(self, key, ttl):
+        return key not in self.ts or (time.time() - self.ts[key]) >= ttl
+
+    def sample(self, procs=True):
+        now = time.time()
+        c = self.cache
+        show = _show_cfg(self.cfg)
+        changed = False
+
+        if self.force_limits or "limits" not in self.cache or self._due("limits", TTL_LIMITS):
+            c["limits"] = claude_limits(force=self.force_limits)
+            self.force_limits = False
+            self.ts["limits"] = now
+            changed = True
+        else:
+            c["limits"] = self.cache.get("limits")
+        if self._due("claude", TTL_CLAUDE):
+            c["claude"] = claude_today()
+            self.ts["claude"] = now
+            changed = True
+        if self._due("oc", TTL_OC):
+            c["oc"] = opencode_stats()
+            self.ts["oc"] = now
+            changed = True
+        if self._due("cpu", TTL_CPU):
+            c["pcts"] = self.cpu.pcts()
+            self.ts["cpu"] = now
+            changed = True
+        if self._due("sys", TTL_SYS):
+            try:
+                c["load"] = os.getloadavg()
+            except Exception:
+                c["load"] = (0.0, 0.0, 0.0)
+            c["mem"] = meminfo()
+            c["temp"] = temperature()
+            c["gpu"] = gpu_busy() if _as_bool(show.get("gpu"), True) else None
+            c["gt"] = gpu_temp() if _as_bool(show.get("gpu"), True) else None
+            c["bat"] = self.bat.read()
+            c["uptime"] = uptime()
+            self.ts["sys"] = now
+            changed = True
+        if self._due("io", TTL_IO):
+            c["disk"] = self.disk.rates() if _as_bool(show.get("disk"), True) else None
+            c["net"] = self.net.rates() if _as_bool(show.get("network"), True) else None
+            c["root"] = disk_usage_root()
+            self.ts["io"] = now
+            changed = True
+        if procs and self._due("procs", TTL_PROCS):
+            c["procs"] = top_procs(4) if _as_bool(show.get("processes"), True) else []
+            self.ts["procs"] = now
+            changed = True
+        if self._due("speed", TTL_SPEED):
+            self.speed.update()
+            self.ts["speed"] = now
+            changed = True
+
+        hist_every = _as_float(self.cfg.get("history_interval"), 2.0, 0.2, 60.0)
+        if now - self.last_hist >= hist_every:
+            total = next((p for n, p in c.get("pcts", []) if n == "cpu"), 0.0) or 0.0
+            self.h_cpu.append(total)
+            self.h_load.append((c.get("load") or (0.0, 0.0, 0.0))[0])
+            self.h_temp.append(c.get("temp") or 0)
+            disk = c.get("disk")
+            self.h_io.append((disk[0] + disk[1]) if disk else 0)
+            self.last_hist = now
+            changed = True
+
+        if changed:
+            self.version += 1
+
+        return {
+            "version": self.version,
+            "limits": c.get("limits"),
+            "claude": c.get("claude"),
+            "opencode": c.get("oc"),
+            "speed": self.speed,
+            "pcts": c.get("pcts", []),
+            "load": c.get("load", (0.0, 0.0, 0.0)),
+            "mem": c.get("mem"),
+            "temp": c.get("temp"),
+            "gpu": c.get("gpu"),
+            "gpu_temp": c.get("gt"),
+            "bat": c.get("bat"),
+            "disk": c.get("disk"),
+            "net": c.get("net"),
+            "iface": self.net.iface,
+            "root": c.get("root") or disk_usage_root(),
+            "procs": c.get("procs", []),
+            "uptime": c.get("uptime", 0.0),
+            "hist_cpu": list(self.h_cpu),
+            "hist_load": list(self.h_load),
+            "hist_temp": list(self.h_temp),
+            "hist_io": list(self.h_io),
+        }
+
+
+def _header(app, data, W, show_ms):
+    t = app.theme
+    ts = (datetime.now().strftime("%H:%M:%S.%f")[:-4] if show_ms
+          else datetime.now().strftime("%H:%M:%S"))
+    lim = data.get("limits") or {}
+    worst = 0.0
+    for key_ in ("five_hour", "seven_day"):
+        u = (lim.get(key_) or {}).get("utilization")
+        if u is not None:
+            worst = max(worst, float(u))
+    dot = "red" if lim.get("error") else pct_color(worst)
+    left = (f"{t.c(dot, '●')} {t.c('accent', 'AGENTOP')} {t.c('dim', VERSION)} "
+            f"{t.c('dim', '·')} {t.c('text', t.name)}")
+    extras = []
+    if W >= 80:
+        if data.get("bat") and data["bat"].get("cap") is not None:
+            extras.append(f"{data['bat']['cap']}%")
+        if data.get("temp"):
+            extras.append(f"{data['temp']:.0f}°C")
+    extras.append(f"up {human_left(data['uptime'])}")
+    right = t.c("dim", f"{ts} · {' · '.join(extras)}")
+    return frame_top(t, W, left, right)
+
+
+def _footer(app, W, paused):
+    t = app.theme
+    if paused:
+        hint = f"{key(t, 'p')} продолжить   {key(t, 'q')} выход"
+    else:
+        hint = (f"{key(t, 'r')} обновить   {key(t, 't')} тема   "
+                f"{key(t, 'p')} пауза   {key(t, 'q')} выход")
+    return frame_bottom(t, W, hint)
+
+
+def _single_column(app, data, W, H, show_ms, paused):
+    t = app.theme
+    decimals = _as_int(app.cfg.get("limit_decimals"), 3, 0, 6)
+    big = H >= 34
+    cw = W - 4
+    mem_title = "ПАМЯТЬ · ТЕМПЕРАТУРА" + (" · GPU" if data["gpu"] is not None else "")
+    top = _header(app, data, W, show_ms)
+    bottom = _footer(app, W, paused)
+
+    blocks = [
+        ("limits", "LIMITS", limits_lines(data["limits"], t, cw, decimals), False),
+        ("tokens", "ТОКЕНЫ · СЕГОДНЯ", tokens_lines(data["claude"], data["opencode"], t, cw), False),
+        ("speed", "СКОРОСТЬ ТОКЕНОВ · 15 МИН", None, False),
+        ("cpu", "CPU", None, False),
+        ("mem", mem_title,
+         mem_lines(data["mem"], data["temp"], data["gpu"], data["gpu_temp"], data["hist_temp"], t, cw), False),
+        ("power", "ПИТАНИЕ", power_lines(data["bat"], t, cw), True),
+    ]
+    if data["disk"] or data["net"]:
+        blocks.append(("io", "ДИСК · СЕТЬ",
+                       io_lines(data["disk"], data["net"], data["root"], data["iface"],
+                                data["hist_io"], t, cw), True))
+    if data["procs"]:
+        blocks.append(("procs", "ТОП ПРОЦЕССОВ", proc_lines(data["procs"], t, cw), True))
+
+    pc = _as_bool(_show_cfg(app.cfg).get("per_core"), True)
+
+    def compose(per_core=True, optional=True, big_graph=big, tiny=False):
+        out = [top]
+        for name, title, lines, opt in blocks:
+            if opt and not optional:
+                continue
+            if tiny and name == "mem":
+                continue
+            out.append(content_line(t, W, head(t, cw, title)))
+            if name == "cpu":
+                body = cpu_lines(data["pcts"], data["load"], data["hist_cpu"],
+                                 data["hist_load"], t, cw, per_core=per_core)
+            elif name == "speed":
+                body = speed_lines(data["speed"], t, cw, big=big_graph)
+            else:
+                body = lines
+            out.extend(content_line(t, W, x) for x in body)
+        out.append(bottom)
+        return [clip(x, W) for x in out]
+
+    options = [(pc, True, big, False), (pc, False, big, False)]
+    if pc:
+        options.append((False, False, big, False))
+    options += [(False, False, False, False), (False, False, False, True)]
+    for per_core, optional, big_graph, tiny in options:
+        lines = compose(per_core, optional, big_graph, tiny)
+        if len(lines) <= H:
+            return lines
+    return compose(False, False, False, True)[:H]
+
+
+def _double_column(app, data, W, H, show_ms, paused):
+    t = app.theme
+    decimals = _as_int(app.cfg.get("limit_decimals"), 3, 0, 6)
+    top = _header(app, data, W, show_ms)
+    bottom = _footer(app, W, paused)
+    lw = (W - 7) // 2
+    rw = W - 7 - lw
+    mem_title = "ПАМЯТЬ · ТЕМПЕРАТУРА" + (" · GPU" if data["gpu"] is not None else "")
+
+    def col(title, body, width):
+        return [head(t, width, title)] + [clip(x, width) for x in body]
+
+    def build(per_core=True, optional=True):
+        left = []
+        left += col("LIMITS", limits_lines(data["limits"], t, lw, decimals), lw)
+        left += col("ТОКЕНЫ · СЕГОДНЯ", tokens_lines(data["claude"], data["opencode"], t, lw), lw)
+        left += col("СКОРОСТЬ ТОКЕНОВ", speed_lines(data["speed"], t, lw, big=False), lw)
+
+        right = []
+        right += col("CPU", cpu_lines(data["pcts"], data["load"], data["hist_cpu"],
+                                      data["hist_load"], t, rw, per_core=per_core), rw)
+        right += col(mem_title, mem_lines(data["mem"], data["temp"], data["gpu"],
+                                          data["gpu_temp"], data["hist_temp"], t, rw), rw)
+        if optional:
+            if data["bat"] and data["bat"].get("cap") is not None:
+                right += col("ПИТАНИЕ", power_lines(data["bat"], t, rw), rw)
+            if data["disk"] or data["net"]:
+                right += col("ДИСК · СЕТЬ", io_lines(data["disk"], data["net"], data["root"],
+                                                     data["iface"], data["hist_io"], t, rw), rw)
+            if data["procs"]:
+                right += col("ТОП ПРОЦЕССОВ", proc_lines(data["procs"], t, rw), rw)
+
+        rows = max(len(left), len(right))
+        left += [""] * (rows - len(left))
+        right += [""] * (rows - len(right))
+        out = [top]
+        for l, r in zip(left, right):
+            out.append(t.c("dim", "│ ") + pad(l, lw) + t.c("dim", " │ ") + pad(r, rw) + t.c("dim", " │"))
+        out.append(bottom)
+        return [clip(x, W) for x in out]
+
+    pc = _as_bool(_show_cfg(app.cfg).get("per_core"), True)
+    for per_core, optional in ((pc, True), (pc, False), (False, False)):
+        lines = build(per_core, optional)
+        if len(lines) <= H:
+            return lines
+    return build(False, False)[:H]
+
+
+def render(app, data, W, H, show_ms=False, paused=False):
+    if W >= 96:
+        return _double_column(app, data, W, H, show_ms, paused)
+    return _single_column(app, data, W, H, show_ms, paused)
+
+
+def short(app, data):
+    lim = data["limits"] or {}
+    parts = []
+    if lim.get("error"):
+        parts.append("claude --")
+    else:
+        for label, key in (("5h", "five_hour"), ("7d", "seven_day")):
+            o = lim.get(key) or {}
+            if o.get("utilization") is not None:
+                parts.append(f"{label} {max(0, 100 - float(o['utilization'])):.0f}% left")
+    parts.append(f"{data['speed'].rate(60):.0f} tok/s")
+    otot = (data["opencode"] or {}).get("today") or {}
+    if otot:
+        parts.append(f"${float(otot.get('cost') or 0):.3f}")
+    parts.append(f"load {data['load'][0]:.1f}")
+    total = next((p for n, p in data["pcts"] if n == "cpu"), None)
+    if total is not None:
+        parts.append(f"cpu {total:.0f}%")
+    if data["bat"] and data["bat"].get("cap") is not None:
+        parts.append(f"bat {data['bat']['cap']}%")
+    return " · ".join(parts)
+
+
+def json_out(app, data):
+    lim = data["limits"] or {}
+    otot = (data["opencode"] or {}).get("today") or {}
+    ctot = (data["claude"] or {}).get("totals") or {}
+    total = next((p for n, p in data["pcts"] if n == "cpu"), None)
+    return json.dumps({
+        "version": VERSION,
+        "theme": app.theme.name,
+        "limits": {"five_hour": lim.get("five_hour"), "seven_day": lim.get("seven_day"),
+                   "error": lim.get("error"), "stale": lim.get("_stale", False)},
+        "claude": {"totals": ctot, "date": (data["claude"] or {}).get("date")},
+        "opencode": {"today": otot, "all_cost": (data["opencode"] or {}).get("all_cost")},
+        "speed": {"now": data["speed"].rate(30), "avg5m": data["speed"].rate(300),
+                  "peak": data["speed"].peak(60, 900)},
+        "system": {"load": list(data["load"]), "cpu": total,
+                   "cores": [p for n, p in data["pcts"] if n != "cpu"],
+                   "mem": data["mem"], "temp": data["temp"],
+                   "gpu": data["gpu"], "gpu_temp": data["gpu_temp"],
+                   "battery": data["bat"], "disk": data["disk"],
+                   "net": data["net"], "iface": data["iface"],
+                   "uptime": data["uptime"]},
+        "processes": data["procs"],
+    }, ensure_ascii=False, indent=2)
+
+
+# ───────────────────────────── main ─────────────────────────────
+def main():
+    ap = argparse.ArgumentParser(add_help=True, description="agentop — агенты и железо")
+    ap.add_argument("--once", action="store_true", help="вывести один раз")
+    ap.add_argument("--short", action="store_true", help="одна строка")
+    ap.add_argument("--json", action="store_true", help="JSON")
+    ap.add_argument("--refresh", "-r", action="store_true", help="сбросить кэш")
+    ap.add_argument("--theme", help="тема на один запуск")
+    ap.add_argument("--set-theme", help="сохранить тему в конфиг")
+    ap.add_argument("--list-themes", action="store_true", help="список тем")
+    ap.add_argument("--config", action="store_true", help="показать конфиг")
+    ap.add_argument("--ms", action="store_true", help="часы с сантисекундами; включает -i 0.01 (нагружает)")
+    ap.add_argument("--version", action="version", version=f"agentop {VERSION}")
+    ap.add_argument("-i", "--interval", type=float, help="интервал обновления, сек")
+    args = ap.parse_args()
+
+    cfg = load_config()
+
+    if args.list_themes:
+        print("auto (по теме GNOME) +")
+        for name in THEMES:
+            print("  " + name)
+        return
+
+    if args.set_theme:
+        name = args.set_theme
+        if name not in THEMES and name != "auto":
+            print(f"неизвестная тема: {name}", file=sys.stderr)
+            return 2
+        cfg["theme"] = name
+        save_config(cfg)
+        print(f"тема сохранена: {name}")
+        return
+
+    if args.config:
+        print(CONFIG_PATH)
+        print(json.dumps(cfg, indent=2, ensure_ascii=False))
+        return
+
+    if args.theme:
+        cfg["theme"] = args.theme
+    if args.refresh:
+        clear_cache()
+
+    one_shot = (args.once or args.short or args.json
+                or not (sys.stdout.isatty() and sys.stdin.isatty()))
+
+    app = App(cfg, threaded=not one_shot)
+    if args.refresh:
+        app.force_limits = True
+    interval = max(0.01, args.interval if args.interval is not None
+                   else _as_float(cfg.get("interval"), 1.0, 0.01, 3600.0))
+    if args.ms and args.interval is None and interval > 0.05:
+        interval = 0.01
+    show_ms = bool(args.ms or _as_bool(cfg.get("clock_ms"), False))
+
+    size = shutil.get_terminal_size((80, 24))
+    W = max(52, min(size.columns - 1, 120))
+    H = max(20, size.lines)
+
+    if one_shot:
+        time.sleep(0.35)
+        data = app.sample()
+        if args.json:
+            print(json_out(app, data))
+        elif args.short:
+            print(short(app, data))
+        else:
+            print("\n".join(render(app, data, W, H, show_ms=show_ms)))
+        return
+
+    # живой режим
+    fd = sys.stdin.fileno()
+    old_term = None
+    if termios and tty and sys.stdin.isatty():
+        try:
+            old_term = termios.tcgetattr(fd)
+            tty.setcbreak(fd)
+        except Exception:
+            old_term = None
+
+    time.sleep(0.35)
+    last_frame = None
+    last_stamp = None
+    last_size_check = 0.0
+    paused = False
+    try:
+        while True:
+            if paused:
+                r, _, _ = select.select([sys.stdin], [], [], None)
+                if not r:
+                    continue
+                ch = sys.stdin.read(1)
+                if not ch:
+                    break
+                if ch in ("q", "Q", "\x03", "\x1b"):
+                    break
+                if ch in ("p", "P"):
+                    paused = False
+                    last_frame = None
+                    last_stamp = None
+                continue
+
+            tick_start = time.time()
+            now = tick_start
+            if now - last_size_check >= 0.5:
+                size = shutil.get_terminal_size((80, 24))
+                W = max(52, min(size.columns - 1, 120))
+                H = max(20, size.lines)
+                last_size_check = now
+
+            data = app.sample()
+            stamp = (data["version"], int(now), W, H, app.theme.name)
+            if show_ms or stamp != last_stamp:
+                frame = "\n".join(render(app, data, W, H, show_ms=show_ms))
+                if frame != last_frame:
+                    sys.stdout.write("\033[H\033[J" + frame)
+                    sys.stdout.flush()
+                    last_frame = frame
+                last_stamp = stamp
+
+            wait = max(0.0, interval - (time.time() - tick_start))
+            r, _, _ = select.select([sys.stdin], [], [], wait)
+            if not r:
+                continue
+            ch = sys.stdin.read(1)
+            if not ch:
+                break
+            if ch in ("q", "Q", "\x03", "\x1b"):
+                break
+            if ch in ("r", "R"):
+                clear_cache()
+                app.ts.clear()
+                app.cache.clear()
+                app.force_limits = True
+                app.speed.claude = ClaudeTail(1800)
+                app.speed.update(force=True)
+                last_frame = None
+                last_stamp = None
+            elif ch in ("t", "T"):
+                names = list(THEMES)
+                cur = app.theme.name
+                nxt = names[(names.index(cur) + 1) % len(names)] if cur in names else names[0]
+                app.theme = Theme(nxt)
+                cfg["theme"] = nxt
+                save_config(cfg)
+                last_frame = None
+                last_stamp = None
+            elif ch in ("p", "P"):
+                paused = True
+                frame = "\n".join(render(app, data, W, H, show_ms=show_ms, paused=True))
+                if frame != last_frame:
+                    sys.stdout.write("\033[H\033[J" + frame)
+                    sys.stdout.flush()
+                    last_frame = frame
+    except (KeyboardInterrupt, OSError):
+        pass
+    finally:
+        if old_term is not None:
+            try:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_term)
+            except Exception:
+                pass
+        try:
+            app.speed.claude._save()
+        except Exception:
+            pass
+        try:
+            sys.stdout.write("\033[H\033[J")
+            sys.stdout.flush()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()
