@@ -45,6 +45,17 @@ agentop --view focus
 agentop --list-views
 ```
 
+## Темы
+
+`auto` следует светлой/тёмной теме GNOME. Переключение: `t`, `--theme` или `--set-theme`.
+
+| | |
+|---|---|
+| **Catppuccin Mocha**<br>![](docs/themes/catppuccin-mocha.png) | **Catppuccin Latte**<br>![](docs/themes/catppuccin-latte.png) |
+| **Dracula**<br>![](docs/themes/dracula.png) | **Nord**<br>![](docs/themes/nord.png) |
+| **Gruvbox**<br>![](docs/themes/gruvbox.png) | **Tokyo Night**<br>![](docs/themes/tokyo-night.png) |
+| **Matrix**<br>![](docs/themes/matrix.png) | **Mono**<br>![](docs/themes/mono.png) |
+
 ## Установка
 
 ```bash

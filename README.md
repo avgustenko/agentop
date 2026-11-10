@@ -50,6 +50,17 @@ agentop --view focus
 agentop --list-views
 ```
 
+## Themes
+
+`auto` follows the GNOME light/dark scheme. Switch with `t`, `--theme` or `--set-theme`.
+
+| | |
+|---|---|
+| **Catppuccin Mocha**<br>![](docs/themes/catppuccin-mocha.png) | **Catppuccin Latte**<br>![](docs/themes/catppuccin-latte.png) |
+| **Dracula**<br>![](docs/themes/dracula.png) | **Nord**<br>![](docs/themes/nord.png) |
+| **Gruvbox**<br>![](docs/themes/gruvbox.png) | **Tokyo Night**<br>![](docs/themes/tokyo-night.png) |
+| **Matrix**<br>![](docs/themes/matrix.png) | **Mono**<br>![](docs/themes/mono.png) |
+
 ## Requirements
 
 - Linux (reads `/proc` and `/sys`), Python 3.9+

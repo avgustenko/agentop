@@ -1265,7 +1265,8 @@ def io_lines(disk, net, root_usage, iface, hist_io, t, W):
         total, used, _ = root_usage
         pct = used / total * 100 if total else 0
         r, w = disk
-        line = (f"  {t.c('text', 'disk')} {t.bar(pct, 12)} {t.c('dim', f'{used / 2**30:.0f}/{total / 2**30:.0f}G')}"
+        barw = 12 if W >= 52 else 8
+        line = (f"  {t.c('text', 'disk')} {t.bar(pct, barw)} {t.c('dim', f'{used / 2**30:.0f}/{total / 2**30:.0f}G')}"
                 f"  {t.c('dim', 'r')} {t.c('text', fmt_bytes(r))}/s"
                 f"  {t.c('dim', 'w')} {t.c('text', fmt_bytes(w))}/s")
         if show_spark:
