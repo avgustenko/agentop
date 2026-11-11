@@ -132,6 +132,14 @@ agentop --version
 - API лимитов отдаёт целые проценты, поэтому `xxx.xxx%` показывает `.000`.
 - При `429` виджет сохраняет последний удачный ответ и не долбит API.
 
+## Тесты
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+25 тестов: форматирование, ANSI/clip/pad, полосы тем, спарклайны, Braille-графики, настройки (get/set/apply), рендер всех пяти видов и smoke-тесты CLI (`--once`, `--json`, `--short`, `--version`). CI запускает их на каждый push.
+
 ## Лицензия
 
 [MIT](LICENSE)

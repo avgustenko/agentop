@@ -160,6 +160,14 @@ In the live view:
 - On `HTTP 429` the widget keeps the last successful limits response and backs off.
 - Claude log parsing and the limits request are the only non-trivial operations; both are cached and/or backgrounded.
 
+## Tests
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+25 tests: formatting helpers, ANSI/clip/pad, theme bars, sparklines, Braille graphs, settings get/set/apply, rendering all five views, and CLI smoke tests (`--once`, `--json`, `--short`, `--version`). CI runs them on every push.
+
 ## License
 
 [MIT](LICENSE)
