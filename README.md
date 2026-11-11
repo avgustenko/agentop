@@ -3,7 +3,7 @@
 **A terminal dashboard for AI coding agents** — Claude limits, token spend, token speed and system health in one live TUI. Think `top`, but for your agents + machine.
 
 ```
-╭─ ● AGENTOP 1.2.1 · catppuccin-mocha ─────────────── 15:42:07 · 88% · 46°C · up 30м ─╮
+╭─ ● AGENTOP 1.3.0 · catppuccin-mocha ─────────────── 15:42:07 · 88% · 46°C · up 30м ─╮
 │ ▐ LIMITS ───────────────────────────────────── │ ▐ CPU ────────────────────────────────────── │
 │   5h  ░░░░░░░░░░░░ 0.000%  ↻ 4ч 32м            │   total ██░░░░░░░░░░  15%  ▁                  │
 │   7d  ███░░░░░░░░░ 23.000%  ↻ 14ч 02м          │   C0 █████ 100  C1 ░░░░░   2  C2 ░░░░░   9   │
@@ -31,7 +31,11 @@
 - **Themes** — `catppuccin-mocha`, `catppuccin-latte`, `dracula`, `nord`, `gruvbox`, `tokyo-night`, `solarized-dark`, `matrix`, `mono`, plus `auto` (follows the GNOME light/dark scheme).
 - **Two layouts** — a two-column dashboard on wide terminals (≥96 cols), a single clean column on narrow ones.
 - **Low overhead** — ~0.4 % CPU, ~40 MB RAM, one wakeup per second, redraws only when data changes. Press `p` to pause (0 % CPU).
-- **Machine-readable** — `--short` (one line for a status bar) and `--json`.
+- **Per-model spend** — today's usage per model (opus/sonnet, deepseek-flash/v4-pro); for Claude, what it would cost at API prices (5 min / 1 h cache writes and fast mode included).
+- **Limit trend** — a limits log (`~/.cache/agentop/limits_history.jsonl`, 8 days) drives a sparkline of the current window and a forecast at reset based on the last 30 minutes.
+- **Notifications** — `notify-send` at 80 % and 95 % of a window, once per window.
+- **Machine-readable** — `--short` (one line), `--json`, `--waybar` (Waybar custom module) and `--argos` (GNOME top bar via the Argos extension).
+- **Russian keyboard layout** — hotkeys work on ЙЦУКЕН too (`к` = `r`, `й` = `q`, …).
 
 ## Views
 
@@ -96,6 +100,8 @@ agentop
 agentop                 # live dashboard
 agentop --short         # one line (status bar / prompt)
 agentop --json          # machine-readable snapshot
+agentop --waybar        # Waybar custom module JSON
+agentop --argos         # GNOME top bar (Argos extension)
 agentop --once          # render once and exit
 agentop -i 2            # refresh every 2 s (default 1 s)
 agentop --theme nord    # theme for this run
@@ -133,7 +139,10 @@ In the live view:
   "history_interval": 2.0,
   "limit_decimals": 3,
   "clock_ms": false,
-  "show": {"network": true, "disk": true, "processes": true, "gpu": true, "per_core": true}
+  "notify": true,
+  "notify_thresholds": [80, 95],
+  "show": {"network": true, "disk": true, "processes": true, "gpu": true, "per_core": true,
+           "models": true}
 }
 ```
 
@@ -141,6 +150,23 @@ In the live view:
 - `history` × `history_interval` — length of sparkline history.
 - `limit_decimals` — decimals for limit percentages (the API currently returns whole percents, so you'll see `.000`).
 - `show.*` — toggle sections.
+- `notify`, `notify_thresholds` — limit notifications (thresholds in %).
+- `prices` — override built-in prices: `{"claude-opus-5-5": [input, output, cache write 5m, cache read]}`, USD per 1M tokens.
+
+### GNOME top bar (Argos)
+
+Install the [Argos](https://github.com/p-e-w/argos) extension and create `~/.config/argos/agentop.30s.sh`:
+
+```bash
+#!/usr/bin/env bash
+exec ~/.local/bin/agentop --argos
+```
+
+### Waybar
+
+```json
+"custom/agentop": {"exec": "agentop --waybar", "return-type": "json", "interval": 30}
+```
 
 ## How it works
 
@@ -158,6 +184,7 @@ In the live view:
 - The TUI labels are currently in Russian. The code and docs are English-friendly; PRs for i18n are welcome.
 - The limit API returns whole percents, so `xxx.xxx%` currently shows `.000` after the dot.
 - On `HTTP 429` the widget keeps the last successful limits response and backs off.
+- The Claude "API price" figure is an estimate for comparison with your subscription, not a bill.
 - Claude log parsing and the limits request are the only non-trivial operations; both are cached and/or backgrounded.
 
 ## Tests
@@ -166,7 +193,7 @@ In the live view:
 python3 -m unittest discover -s tests -v
 ```
 
-25 tests: formatting helpers, ANSI/clip/pad, theme bars, sparklines, Braille graphs, settings get/set/apply, rendering all five views, and CLI smoke tests (`--once`, `--json`, `--short`, `--version`). CI runs them on every push.
+43 tests: formatting, ANSI/clip/pad, theme bars, sparklines, Braille graphs, settings, all views, key input (UTF-8, Russian layout, EOF), pricing, the limits log and trend, notifications, Waybar/Argos output and CLI smoke tests. Tests run with a temporary `HOME`, so they never read your logs or call the API with your token. CI runs them on every push.
 
 ## License
 

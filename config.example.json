@@ -6,11 +6,17 @@
   "history_interval": 2.0,
   "limit_decimals": 3,
   "clock_ms": false,
+  "notify": true,
+  "notify_thresholds": [
+    80,
+    95
+  ],
   "show": {
     "network": true,
     "disk": true,
     "processes": true,
     "gpu": true,
-    "per_core": true
+    "per_core": true,
+    "models": true
   }
 }
