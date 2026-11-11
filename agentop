@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-agentop 1.3.0 — терминальный дашборд агентов и железа.
+agentop 1.4.0 — терминальный дашборд агентов и железа.
 
   agentop                 живой виджет
   agentop --once          один кадр
@@ -14,27 +14,32 @@ agentop 1.3.0 — терминальный дашборд агентов и же
   agentop --config        путь к конфигу
   agentop --ms            часы с сантисекундами (~100 FPS)
 
-В живом режиме: r — обновить, t — тема, v — вид, s — настройки, p — пауза,
-q — выход (работает и в русской раскладке).
+В живом режиме: r — обновить, t — тема, v — вид, d — диспетчер задач,
+s — настройки, p — пауза, q — выход (работает и в русской раскладке).
 
 Данные: лимиты Claude (официальный OAuth-эндпоинт), логи Claude Code,
 SQLite opencode, /proc, /sys. Секреты не выводятся и не кэшируются.
 """
 
 import argparse
+import base64
 import glob
 import json
+import math
 import os
 import re
 import select
 import shutil
+import signal
 import sqlite3
+import struct
 import subprocess
 import sys
 import threading
 import time
 import urllib.error
 import urllib.request
+import zlib
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -44,9 +49,14 @@ try:
     import tty
 except ImportError:
     termios = tty = None
+try:
+    import pwd
+except ImportError:
+    pwd = None
 
-VERSION = "1.3.0"
-VIEWS = ("dashboard", "focus", "system", "compact", "minimal")
+VERSION = "1.4.0"
+VIEWS = ("dashboard", "focus", "timeline", "gauges", "fuel", "brief", "feed", "week",
+         "tiles", "cockpit", "sidebar", "beacon", "tasks", "system", "compact", "minimal")
 COLOR = (sys.stdout.isatty() and "NO_COLOR" not in os.environ
          and os.environ.get("TERM") != "dumb")
 
@@ -181,6 +191,7 @@ DEFAULT_CONFIG = {
     "clock_ms": False,
     "notify": True,
     "notify_thresholds": [80, 95],
+    "panel_style": "text",
     "show": {"network": True, "disk": True, "processes": True, "gpu": True,
              "per_core": True, "models": True},
 }
@@ -818,6 +829,8 @@ class ClaudeTail:
         self.offset = {}
         self.seen = set()
         self.events = []
+        self.feed = []
+        self.prices = None
         self.last = 0.0
         self.last_save = 0.0
         self._load()
@@ -828,6 +841,7 @@ class ClaudeTail:
             if time.time() - d.get("ts", 0) < 86400:
                 self.offset = {k: int(v) for k, v in (d.get("offset") or {}).items()}
                 self.events = [(float(a), int(b), c) for a, b, c in (d.get("events") or [])]
+                self.feed = [e for e in (d.get("feed") or []) if isinstance(e, dict) and "ts" in e]
         except Exception:
             pass
 
@@ -838,6 +852,7 @@ class ClaudeTail:
                 "ts": time.time(),
                 "offset": self.offset,
                 "events": self.events[-5000:],
+                "feed": self.feed[-300:],
             }))
             os.chmod(tmp, 0o600)
             tmp.replace(TAIL_CACHE)
@@ -899,12 +914,19 @@ class ClaudeTail:
                 if key in self.seen:
                     continue
                 self.seen.add(key)
-                self.events.append((ts, int(u.get("output_tokens") or 0), msg.get("model") or "?"))
+                model = msg.get("model") or "?"
+                self.events.append((ts, int(u.get("output_tokens") or 0), model))
+                if not model.startswith("<"):
+                    self.feed.append({"ts": ts, "model": model, "out": int(u.get("output_tokens") or 0),
+                                      "cache": int(u.get("cache_read_input_tokens") or 0),
+                                      "cost": usage_cost(model, u, self.prices) or 0.0, "api": True})
 
         if len(self.seen) > 200_000:
             self.seen.clear()
         cutoff = time.time() - self.window
         self.events = [e for e in self.events if e[0] >= cutoff]
+        self.feed.sort(key=lambda e: e["ts"])
+        self.feed = self.feed[-300:]
         if now - self.last_save > 30:
             self._save()
 
@@ -1290,11 +1312,11 @@ def gpu_temp():
 
 
 class Procs:
-    """Текущая загрузка процессов по дельтам /proc/<pid>/stat между замерами.
+    """Процессы по дельтам /proc/<pid>/stat между замерами.
 
     `ps %CPU` — среднее за всю жизнь процесса, поэтому только что
     нагрузивший CPU процесс в такой топ не попадает. Здесь — среднее
-    за интервал между вызовами top() (как в top/htop: 100% = одно ядро).
+    за интервал между замерами (как в top/htop: 100% = одно ядро).
     """
 
     def __init__(self):
@@ -1303,6 +1325,10 @@ class Procs:
             self.page = os.sysconf("SC_PAGE_SIZE")
         except (ValueError, OSError, AttributeError):
             self.hz, self.page = 100, 4096
+        self.users = {}
+        self.cmds = {}
+        self.apps = {}
+        self._snap = None
         self.prev = self._read()
         self.last = time.time()
 
@@ -1312,6 +1338,7 @@ class Procs:
         for d in glob.glob("/proc/[0-9]*"):
             try:
                 raw = Path(d, "stat").read_text()
+                uid = os.stat(d).st_uid
             except Exception:
                 continue
             i, j = raw.find("("), raw.rfind(")")
@@ -1319,29 +1346,328 @@ class Procs:
                 continue
             f = raw[j + 2:].split()
             try:
-                # f[11]=utime, f[12]=stime, f[21]=rss (страницы)
-                out[int(d[6:])] = (raw[i + 1:j], int(f[11]) + int(f[12]), int(f[21]))
+                # f[0]=state f[1]=ppid f[11]=utime f[12]=stime f[17]=threads f[21]=rss (страницы)
+                out[int(d[6:])] = (raw[i + 1:j], int(f[11]) + int(f[12]), int(f[21]),
+                                   f[0], int(f[17]), uid, int(f[1]))
             except (ValueError, IndexError):
                 continue
         return out
 
-    def top(self, n=5):
-        cur = self._read()
+    def user(self, uid):
+        if uid not in self.users:
+            try:
+                self.users[uid] = pwd.getpwuid(uid).pw_name if pwd else str(uid)
+            except (KeyError, AttributeError):
+                self.users[uid] = str(uid)
+        return self.users[uid]
+
+    def cmdline(self, pid):
+        key = (pid, self.prev.get(pid, ("",))[0])
+        if key not in self.cmds:
+            try:
+                raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+                self.cmds[key] = raw.replace(b"\0", b" ").decode("utf-8", "replace").strip()
+            except OSError:
+                self.cmds[key] = ""
+            if len(self.cmds) > 4000:
+                self.cmds.clear()
+        return self.cmds[key]
+
+    INTERPRETERS = re.compile(r"^(python[\d.]*|node|nodejs|bun|deno|bash|sh|dash|zsh|fish|perl|ruby|java|gjs|electron)$")
+
+    def app_name(self, pid, comm):
+        """Имя приложения: исполняемый файл (дочерние процессы браузера → браузер)."""
+        key = (pid, comm)
+        if key not in self.apps:
+            name = comm
+            try:
+                exe = os.path.basename(os.readlink(f"/proc/{pid}/exe")).replace(" (deleted)", "")
+                if exe and not self.INTERPRETERS.match(exe) and not re.match(r"^[\d.]+$", exe):
+                    name = exe
+            except OSError:
+                pass
+            if name == comm and len(comm) >= 15:
+                # comm обрезан ядром до 15 символов — берём argv[0]
+                arg0 = os.path.basename(self.cmdline(pid).split(" ")[0]) if self.cmdline(pid) else ""
+                if arg0.startswith(comm):
+                    name = arg0
+            self.apps[key] = name
+            if len(self.apps) > 4000:
+                self.apps.clear()
+        return self.apps[key]
+
+    def snapshot(self):
+        """Все процессы: pid, имя, CPU% за интервал, память, потоки, владелец.
+
+        Чаще раза в секунду не пересчитывается: на слишком коротком интервале
+        CPU% у всех получается нулевым.
+        """
         now = time.time()
+        if self._snap is not None and now - self.last < 1.0:
+            return self._snap
+        cur = self._read()
         dt = max(0.05, now - self.last)
         mem = meminfo()
         mem_total = (mem[0] * 2**30) if mem and mem[0] else 0
-        skip = {os.getpid()}
         res = []
-        for pid, (comm, ticks, rss) in cur.items():
-            if pid in skip or pid not in self.prev:
-                continue
-            cpu = max(0, ticks - self.prev[pid][1]) / self.hz / dt * 100.0
-            pmem = rss * self.page / mem_total * 100.0 if mem_total else 0.0
-            res.append((cpu, pmem, comm))
+        for pid, (comm, ticks, rss, state, threads, uid, ppid) in cur.items():
+            prev = self.prev.get(pid)
+            cpu = max(0, ticks - prev[1]) / self.hz / dt * 100.0 if prev else 0.0
+            rss_b = rss * self.page
+            res.append({"pid": pid, "name": comm, "app": self.app_name(pid, comm), "cpu": cpu,
+                        "mem": rss_b / mem_total * 100.0 if mem_total else 0.0,
+                        "rss": rss_b, "state": state, "threads": threads,
+                        "uid": uid, "user": self.user(uid), "ppid": ppid})
         self.prev, self.last = cur, now
+        self._snap = res
+        return res
+
+    def top(self, n=5):
+        me = os.getpid()
+        res = [(x["cpu"], x["mem"], x["app"]) for x in self.snapshot() if x["pid"] != me]
         res.sort(key=lambda x: x[0], reverse=True)
         return res[:n]
+
+
+# ───────────────────── диспетчер задач: завершение ─────────────────────
+SYSTEM_PROCS = {
+    "systemd", "init", "kthreadd", "gnome-shell", "Xwayland", "Xorg", "gdm", "gdm3",
+    "gdm-session-wor", "gnome-session-b", "gnome-session-c", "dbus-daemon", "dbus-broker",
+    "pipewire", "wireplumber", "pipewire-pulse", "NetworkManager", "systemd-logind",
+    "polkitd", "sshd", "login", "mutter-x11-fram", "gsd-xsettings", "at-spi-bus-laun",
+}
+
+
+def _ancestors(pid):
+    out, seen = [], set()
+    while pid > 1 and pid not in seen:
+        seen.add(pid)
+        try:
+            raw = Path(f"/proc/{pid}/stat").read_text()
+            pid = int(raw[raw.rfind(")") + 2:].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+        out.append(pid)
+    return out
+
+
+def proc_risk(proc):
+    """Почему этот процесс опасно или нельзя завершать; None — обычный процесс."""
+    pid = proc["pid"]
+    if pid == os.getpid():
+        return "block", "это сам AgentOp — выйдите клавишей q"
+    if pid == 1 or proc.get("ppid") == 2 or pid == 2:
+        return "block", "процесс ядра или init — завершать нельзя"
+    if pid in _ancestors(os.getpid()):
+        return "warn", "это терминал или оболочка, в которой запущен AgentOp — он закроется тоже"
+    if proc.get("name") in SYSTEM_PROCS or proc.get("app") in SYSTEM_PROCS:
+        return "warn", "системный процесс — может завершиться сеанс или пропасть звук/сеть"
+    if hasattr(os, "getuid") and proc.get("uid") not in (None, os.getuid()):
+        return "warn", f"процесс пользователя {proc.get('user')} — без прав root не завершится"
+    return None
+
+
+def kill_pids(pids, sig):
+    """Послать сигнал. Возвращает (ok, gone, denied) — списки pid."""
+    ok, gone, denied = [], [], []
+    for pid in pids:
+        try:
+            os.kill(pid, sig)
+            ok.append(pid)
+        except ProcessLookupError:
+            gone.append(pid)
+        except PermissionError:
+            denied.append(pid)
+    return ok, gone, denied
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    try:  # зомби считается завершённым
+        return Path(f"/proc/{pid}/stat").read_text().split(") ")[-1][:1] != "Z"
+    except OSError:
+        return False
+
+
+TASK_SORTS = {"c": "cpu", "m": "mem", "n": "name", "i": "pid"}
+TASK_SORT_LABEL = {"cpu": "CPU", "mem": "память", "name": "имя", "pid": "PID"}
+
+
+class TaskState:
+    """Экран «Диспетчер задач»: выбор, сортировка, поиск, группы, подтверждение."""
+
+    def __init__(self):
+        self.sel = 0
+        self.top = 0
+        self.sort = "cpu"
+        self.desc = True
+        self.group = True
+        self.filter = ""
+        self.typing = False
+        self.confirm = None      # {"name", "pids", "risk", "force"}
+        self.pending = None      # {"name", "pids", "deadline"}
+        self.message = None      # (текст, уровень, время)
+        self.rows = []
+        self.back_view = "dashboard"
+
+    def say(self, text, level="text"):
+        self.message = (text, level, time.time())
+
+
+def task_rows(procs, st):
+    """Строки списка с учётом поиска, групп и сортировки."""
+    me = os.getpid()
+    items = [p for p in (procs or []) if p["pid"] != me]
+    if st.filter:
+        q = st.filter.lower()
+        items = [p for p in items if q in p["name"].lower() or q in p.get("app", "").lower() or q in str(p["pid"])]
+    if st.group:
+        groups = {}
+        for p in items:
+            app = p.get("app") or p["name"]
+            g = groups.setdefault(app, {"name": app, "pids": [], "cpu": 0.0, "mem": 0.0,
+                                              "rss": 0, "threads": 0, "users": set(), "pid": p["pid"],
+                                              "uid": p["uid"], "user": p["user"], "ppid": p["ppid"]})
+            g["pids"].append(p["pid"])
+            g["cpu"] += p["cpu"]
+            g["mem"] += p["mem"]
+            g["rss"] += p["rss"]
+            g["threads"] += p["threads"]
+            g["users"].add(p["user"])
+            g["pid"] = min(g["pid"], p["pid"])
+        rows = list(groups.values())
+        for g in rows:
+            g["user"] = next(iter(g["users"])) if len(g["users"]) == 1 else "разные"
+    else:
+        rows = [dict(p, pids=[p["pid"]]) for p in items]
+    key = st.sort
+    if key == "name":
+        rows.sort(key=lambda r: r["name"].lower(), reverse=not st.desc)
+    else:
+        rows.sort(key=lambda r: (r[key], r["rss"]), reverse=st.desc)
+    return rows
+
+
+def task_open_confirm(st, force=False):
+    if not st.rows:
+        return
+    row = st.rows[min(st.sel, len(st.rows) - 1)]
+    risks = [proc_risk(dict(row, pid=pid)) for pid in row["pids"]]
+    block = next((r for r in risks if r and r[0] == "block"), None)
+    if block:
+        st.say(f"«{row['name']}»: {block[1]}", "red")
+        return
+    warn = next((r for r in risks if r), None)
+    st.confirm = {"name": row["name"], "pids": list(row["pids"]),
+                  "risk": warn[1] if warn else None, "force": force}
+
+
+def task_do_kill(st, force):
+    c = st.confirm
+    st.confirm = None
+    if not c:
+        return
+    sig = signal.SIGKILL if force else signal.SIGTERM
+    ok, gone, denied = kill_pids(c["pids"], sig)
+    n = len(c["pids"])
+    what = f"«{c['name']}»" + (f" ({n} процессов)" if n > 1 else f" (PID {c['pids'][0]})")
+    if denied and not ok:
+        st.say(f"{what}: нет прав — это процесс другого пользователя; нужен sudo", "red")
+        return
+    if ok and not force:
+        st.pending = {"name": c["name"], "pids": ok, "deadline": time.time() + 3}
+        st.say(f"{what}: отправлен сигнал завершения…", "yellow")
+    elif ok:
+        st.pending = {"name": c["name"], "pids": ok, "deadline": time.time() + 1, "force": True}
+        st.say(f"{what}: завершён принудительно", "green")
+    elif gone:
+        st.say(f"{what}: уже завершён", "dim")
+    if denied and ok:
+        st.say(f"{what}: часть процессов ({len(denied)}) без прав, остальные завершаются", "yellow")
+
+
+def task_check_pending(st):
+    """Через 3 с после SIGTERM: проверить, закрылось ли, иначе предложить SIGKILL."""
+    pe = st.pending
+    if not pe or time.time() < pe["deadline"]:
+        return False
+    st.pending = None
+    alive = [pid for pid in pe["pids"] if pid_alive(pid)]
+    if not alive:
+        st.say(f"«{pe['name']}» завершён", "green")
+    elif pe.get("force"):
+        st.say(f"«{pe['name']}» не завершился даже принудительно (возможно, ждёт диск или ядро)", "red")
+    else:
+        st.confirm = {"name": pe["name"], "pids": alive, "force": True,
+                      "risk": "процесс не ответил на обычное завершение за 3 с"}
+    return True
+
+
+def tasks_key(app, ch):
+    """Клавиши экрана задач. True — клавиша обработана здесь."""
+    st = app.tasks
+    if st.confirm:
+        if ch in ("y", "Y", "ENTER", "\r", "\n") and not st.confirm.get("force"):
+            task_do_kill(st, False)
+        elif ch in ("y", "Y", "ENTER", "\r", "\n", "K", "f", "F"):
+            task_do_kill(st, True)
+        elif ch in ("n", "N", "ESC", "q", "Q"):
+            st.confirm = None
+            st.say("отменено", "dim")
+        return True
+    if st.typing:
+        if ch in ("ENTER", "\r", "\n"):
+            st.typing = False
+        elif ch == "ESC":
+            st.typing = False
+            st.filter = ""
+        elif ch in ("\x7f", "\x08"):
+            st.filter = st.filter[:-1]
+        elif isinstance(ch, str) and len(ch) == 1 and ch.isprintable():
+            st.filter += ch
+        st.sel = st.top = 0
+        return True
+    n = len(st.rows)
+    page = max(1, getattr(st, "page", 10))
+    if ch in ("UP", "k"):
+        st.sel = max(0, st.sel - 1)
+    elif ch in ("DOWN", "j"):
+        st.sel = min(max(0, n - 1), st.sel + 1)
+    elif ch == "PGUP":
+        st.sel = max(0, st.sel - page)
+    elif ch == "PGDN":
+        st.sel = min(max(0, n - 1), st.sel + page)
+    elif ch == "HOME":
+        st.sel = 0
+    elif ch == "END":
+        st.sel = max(0, n - 1)
+    elif ch in ("x", "X", "DEL"):
+        task_open_confirm(st)
+    elif ch == "K":
+        task_open_confirm(st, force=True)
+    elif ch in TASK_SORTS:
+        key = TASK_SORTS[ch]
+        st.desc = (not st.desc) if st.sort == key else (key != "name")
+        st.sort = key
+    elif ch in ("g", "G"):
+        st.group = not st.group
+        st.sel = st.top = 0
+    elif ch == "/":
+        st.typing = True
+        st.filter = ""
+    elif ch == "ESC":
+        if st.filter:
+            st.filter = ""
+        else:
+            app.view = st.back_view if st.back_view != "tasks" else "dashboard"
+    else:
+        return False
+    return True
 
 
 def uptime():
@@ -1444,7 +1770,7 @@ def limits_lines(lim, t, W, decimals=3, hist=None):
         lines.append(line)
         if W >= 56 and len(pts) >= 2:
             vals = [u for _, u in pts] + [used]
-            extra = f"      {sparkline(resample(vals, 24), t, 'gradient')}"
+            extra = f"      {sparkline(resample(vals, max(8, min(24, W - 42))), t, 'gradient')}"
             if rrate is not None and rem and rem > 0:
                 proj = min(999.0, used + rrate * rem)
                 pcol = "red" if proj >= 100 else "yellow" if proj >= 85 else "dim"
@@ -1688,7 +2014,10 @@ class App:
         self.net = NetIO()
         self.bat = Battery()
         self.procs = Procs()
+        self.tasks = TaskState()
+        self._week_thread = None
         self.speed = Speed(1800)
+        self.speed.claude.prices = cfg.get("prices")
         self.force_limits = False
         self.ts = {}
         self.cache = {}
@@ -1810,10 +2139,44 @@ class App:
             c["procs"] = self.procs.top(4) if _as_bool(show.get("processes"), True) else []
             self.ts["procs"] = now
             changed = True
-        if self._due("speed", TTL_SPEED):
-            self.speed.update()
+        live_feed = self.view == "feed"
+        if self._due("speed", 3.0 if live_feed else TTL_SPEED):
+            self.speed.update(force=live_feed)
             self.ts["speed"] = now
             changed = True
+        if live_feed and self._due("oc_feed", 5.0):
+            c["oc_feed"] = opencode_feed()
+            self.ts["oc_feed"] = now
+            changed = True
+        if self.view == "tasks":
+            if self._due("tasks", 2.0):
+                c["tasks"] = self.procs.snapshot()
+                self.ts["tasks"] = now
+                changed = True
+            if task_check_pending(self.tasks):
+                self.ts.pop("tasks", None)
+                changed = True
+        if self.view == "week":
+            wk = c.get("week")
+            if wk is None:
+                try:
+                    wk = json.loads(WEEK_CACHE.read_text())
+                    c["week"] = wk
+                except Exception:
+                    wk = None
+            stale = not wk or now - float(wk.get("ts", 0)) > 600
+            if stale and not (self._week_thread and self._week_thread.is_alive()):
+                def work():
+                    try:
+                        c["week"] = week_activity()
+                        self.version += 1
+                    except Exception:
+                        pass
+                if self._threaded:
+                    self._week_thread = threading.Thread(target=work, daemon=True)
+                    self._week_thread.start()
+                else:
+                    work()
 
         hist_every = _as_float(self.cfg.get("history_interval"), 2.0, 0.2, 60.0)
         if now - self.last_hist >= hist_every:
@@ -1849,6 +2212,7 @@ class App:
             "iface": self.net.iface,
             "root": c.get("root") or disk_usage_root(),
             "procs": c.get("procs", []),
+            "tasks": c.get("tasks"),
             "uptime": c.get("uptime", 0.0),
             "hist_cpu": list(self.h_cpu),
             "hist_load": list(self.h_load),
@@ -1889,7 +2253,7 @@ def _footer(app, W, paused):
     if paused:
         hint = f"{key(t, 'p')} продолжить   {key(t, 'q')} выход"
     else:
-        hint = (f"{key(t, 'r')} обновить  {key(t, 't')} тема  {key(t, 'v')} вид  "
+        hint = (f"{key(t, 'r')} обновить  {key(t, 't')} тема  {key(t, 'v')} вид  {key(t, 'd')} задачи  "
                 f"{key(t, 's')} настройки  {key(t, 'p')} пауза  {key(t, 'q')} выход")
     return frame_bottom(t, W, hint)
 
@@ -1912,6 +2276,7 @@ def settings_items(cfg):
         ("limit_decimals", "Знаков в лимитах", DECIMALS_CHOICES),
         ("clock_ms", "Сантисекунды", BOOL_CHOICES),
         ("notify", "Уведомления", BOOL_CHOICES),
+        ("panel_style", "Стиль панели (Argos)", list(PANEL_STYLES)),
         ("show.models", "Модели", BOOL_CHOICES),
         ("show.network", "Сеть", BOOL_CHOICES),
         ("show.disk", "Диск", BOOL_CHOICES),
@@ -1989,11 +2354,16 @@ def persist_setting(key, value):
 RU_KEYS = {"к": "r", "К": "R", "е": "t", "Е": "T", "м": "v", "М": "V",
            "ы": "s", "Ы": "S", "з": "p", "З": "P", "й": "q", "Й": "Q",
            "л": "k", "Л": "K", "о": "j", "О": "J", "р": "h", "Р": "H",
-           "д": "l", "Д": "L"}
+           "д": "l", "Д": "L", "в": "d", "В": "D", "ч": "x", "Ч": "X",
+           "с": "c", "С": "C", "ь": "m", "Ь": "M", "т": "n", "Т": "N",
+           "ш": "i", "Ш": "I", "п": "g", "П": "G", "н": "y", "Н": "Y", "а": "f", "А": "F"}
 
 
-def read_key(fd):
-    """Одна клавиша. None — конец ввода (EOF/ошибка), "" — непонятный байт."""
+def read_key(fd, translate=True):
+    """Одна клавиша. None — конец ввода (EOF/ошибка), "" — непонятный байт.
+
+    translate=False — без перевода русской раскладки (для ввода текста в поиске).
+    """
     def read1():
         try:
             return os.read(fd, 1)
@@ -2014,7 +2384,7 @@ def read_key(fd):
                 break
             b += read1()
         ch = b.decode("utf-8", "ignore")
-        return RU_KEYS.get(ch, ch)
+        return RU_KEYS.get(ch, ch) if translate else ch
     r, _, _ = select.select([fd], [], [], 0.02)
     if not r:
         return "ESC"
@@ -2024,7 +2394,21 @@ def read_key(fd):
         if not r:
             return "ESC"
         code = read1()
-        return {b"A": "UP", b"B": "DOWN", b"C": "RIGHT", b"D": "LEFT"}.get(code, "ESC")
+        if code.isdigit():
+            # ESC [ 3 ~ и т.п.: дочитываем до «~»
+            num = code
+            for _ in range(4):
+                r, _, _ = select.select([fd], [], [], 0.02)
+                if not r:
+                    break
+                c2 = read1()
+                if c2 == b"~" or not c2:
+                    break
+                num += c2
+            return {b"1": "HOME", b"7": "HOME", b"4": "END", b"8": "END", b"3": "DEL",
+                    b"5": "PGUP", b"6": "PGDN"}.get(num.split(b";")[0], "ESC")
+        return {b"A": "UP", b"B": "DOWN", b"C": "RIGHT", b"D": "LEFT",
+                b"H": "HOME", b"F": "END"}.get(code, "ESC")
     return "ESC"
 
 
@@ -2264,7 +2648,874 @@ def _double_column(app, data, W, H, show_ms, paused):
     return build(False, False)[:H]
 
 
+# ═════════════════════════ дополнительные виды ═════════════════════════
+BIG_DIGITS = {
+    "0": ("█▀█", "█ █", "▀▀▀"), "1": ("▀█ ", " █ ", "▀▀▀"), "2": ("▀▀█", "█▀▀", "▀▀▀"),
+    "3": ("▀▀█", " ▀█", "▀▀▀"), "4": ("█ █", "▀▀█", "  ▀"), "5": ("█▀▀", "▀▀█", "▀▀▀"),
+    "6": ("█▀▀", "█▀█", "▀▀▀"), "7": ("▀▀█", "  █", "  ▀"), "8": ("█▀█", "█▀█", "▀▀▀"),
+    "9": ("█▀█", "▀▀█", "▀▀▀"), "%": ("▀ █", " █ ", "█ ▄"), "-": ("   ", "▀▀▀", "   "),
+}
+WEEKDAYS_ACC = ("понедельник", "вторник", "среду", "четверг", "пятницу", "субботу", "воскресенье")
+WEEKDAYS_SHORT = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
+
+
+def big_text(s, wide=False):
+    rows = []
+    for r in range(3):
+        parts = [BIG_DIGITS.get(ch, ("   ",) * 3)[r] for ch in s]
+        line = " ".join(parts)
+        rows.append("".join(c * 2 for c in line) if wide else line)
+    return rows
+
+
+def hhmm(ts):
+    return datetime.fromtimestamp(ts).strftime("%H:%M")
+
+
+def _cell(ch, n):
+    return f"\033[38;5;{n}m{ch}\033[0m" if COLOR else ch
+
+
+def _center(s, w):
+    return " " * max(0, (w - vlen(s)) // 2) + s
+
+
+def _fitw(s, w):
+    return pad(clip(s, w), w)
+
+
+def lim_info(data, label, key):
+    lim = data.get("limits") or {}
+    if lim.get("error"):
+        return None
+    o = lim.get(key) or {}
+    if o.get("utilization") is None:
+        return None
+    used = float(o["utilization"])
+    reset = _iso_ts(o.get("resets_at"))
+    now = time.time()
+    rem = (reset - now) if reset else None
+    pts = list((data.get("limits_hist") or {}).get(label) or [])
+    rate = recent_rate(pts + [(now, used)]) if pts else None
+    proj = used + rate * rem if (rate is not None and rem and rem > 0) else None
+    wlen = dict((lb, wl) for lb, _, wl in LIMIT_WINDOWS).get(label, 5 * 3600)
+    if wlen > 86400 and rem is not None:
+        # неделя: темп 30 минут на 6 дней вперёд не экстраполируем — берём средний темп окна
+        elapsed = wlen - rem
+        rate = used / elapsed if elapsed > 6 * 3600 else None
+        proj = used * wlen / elapsed if elapsed > 6 * 3600 else None
+    return {"used": used, "reset": reset, "rem": rem, "expired": window_expired(o),
+            "pts": pts, "rate": rate, "proj": proj}
+
+
+def _framed(app, data, W, H, show_ms, paused, body):
+    t = app.theme
+    room = max(0, H - 2)
+    out = [_header(app, data, W, show_ms)]
+    out += [content_line(t, W, x) for x in body[:room]]
+    out.append(_footer(app, W, paused))
+    return [clip(x, W) for x in out]
+
+
+def _no_limits(t, info):
+    if info is None:
+        return t.c("dim", "нет данных о лимитах")
+    return t.c("green", "окно сброшено") + t.c("dim", " · ждём свежие данные")
+
+
+def _speed_now(data):
+    s = data["speed"].snapshot()
+    return s["now"], s["peak"], s["buckets"]
+
+
+def _proj_color(p):
+    return "red" if p >= 100 else "yellow" if p >= 85 else "green"
+
+
+# ── timeline: ось окна 5h с прогнозом ──
+def _timeline_view(app, data, W, H, show_ms, paused):
+    t = app.theme
+    cw = W - 4
+    info = lim_info(data, "5h", "five_hour")
+    if not info or info["expired"] or not info["reset"]:
+        return _framed(app, data, W, H, show_ms, paused,
+                       [head(t, cw, "ОКНО 5h"), "  " + _no_limits(t, info)])
+    wlen = 5 * 3600
+    start, now = info["reset"] - wlen, time.time()
+    body = [head(t, cw, f"ОКНО 5h · {hhmm(start)} → {hhmm(info['reset'])}")]
+    C = max(20, cw - 7)
+    R = 7 if H >= 24 else 5 if H >= 19 else 3
+    now_col = min(C - 1, max(0, int((now - start) / wlen * C)))
+    pts = sorted(info["pts"]) + [(now, info["used"])]
+    pal = t.p["palette"]
+    th_row = R - 1 - int(0.8 * R)
+
+    def val_at(ts):
+        v = 0.0
+        for a, b in pts:
+            if a <= ts:
+                v = b
+        return v
+
+    for r in range(R):
+        level = R - 1 - r
+        yl = "100%┤" if r == 0 else " 80%┤" if r == th_row else "  0%┤" if r == R - 1 else "    │"
+        cells = []
+        for i in range(C):
+            ts = start + (i + 0.5) / C * wlen
+            if i <= now_col:
+                v = info["used"] if i == now_col else val_at(ts)
+                fill = max(0, min(8, round(v / 100 * R * 8 - level * 8)))
+                if fill:
+                    col = t.p["accent"] if i == now_col else pal[min(len(pal) - 1, level * len(pal) // R)]
+                    cells.append(_cell(SPARK_CHARS[fill - 1], col))
+                elif i == now_col:
+                    cells.append(t.c("accent", "│"))
+                else:
+                    cells.append(t.c("dim", "┈") if r == th_row else " ")
+            else:
+                p = None if info["rate"] is None else info["used"] + info["rate"] * (ts - now)
+                if p is not None and p >= 100 and r == 0:
+                    cells.append(t.c("red", "·"))
+                elif p is not None and p < 100 and R - 1 - min(R - 1, int(p / 100 * R)) == r:
+                    cells.append(t.c("yellow" if p >= 80 else "dim", "·"))
+                else:
+                    cells.append(t.c("dim", "┈") if r == th_row else " ")
+        body.append(" " + t.c("dim", yl) + "".join(cells))
+    body.append(" " + t.c("dim", "    └" + "─" * C))
+    labels = [" "] * C
+    first_hour = (int(start // 3600) + 1) * 3600
+    for hts in range(first_hour, int(info["reset"]), 3600):
+        col = int((hts - start) / wlen * C)
+        lab = hhmm(hts)
+        if 0 <= col and col + len(lab) <= C and all(c == " " for c in labels[max(0, col - 1):col + len(lab)]):
+            labels[col:col + len(lab)] = list(lab)
+    body.append("      " + t.c("dim", "".join(labels)))
+    body.append("      " + " " * now_col + t.c("accent", "▲ сейчас"))
+    line = f"  {t.c('text', 'сейчас')} {t.c(pct_color(info['used']), f'{info['used']:.0f}%')}"
+    if info["rate"] is not None:
+        line += f"  {t.c('dim', '· темп')} {info['rate'] * 3600:.1f}%/ч"
+        line += f"  {t.c('dim', '· к сбросу')} {t.c(_proj_color(info['proj']), f'≈{min(999, info['proj']):.0f}%')}"
+        if info["proj"] >= 100 and info["rate"] > 0:
+            line += "  " + t.c("red", f"· закончится через {human_left((100 - info['used']) / info['rate'])}")
+        else:
+            line += "  " + t.c("green", "· запаса хватит")
+    else:
+        line += "  " + t.c("dim", "· тренд появится через 10 минут журнала")
+    body.append(line)
+    w7 = lim_info(data, "7d", "seven_day")
+    now_s, peak, buckets = _speed_now(data)
+    extra = f"  {t.c('dim', 'неделя')} "
+    extra += (t.c(pct_color(w7["used"]), f"{w7['used']:.1f}%") + t.c("dim", f" · ↻ {human_left(w7['rem'] or 0)}")) if w7 else t.c("dim", "—")
+    extra += f"   {t.c('dim', 'tok/s')} {t.c('green', f'{now_s:.0f}')} {sparkline(buckets, t, 'gradient', 20)}"
+    body.append(extra)
+    return _framed(app, data, W, H, show_ms, paused, body)
+
+
+# ── gauges: стрелочные приборы точками Брайля ──
+def braille_gauge(pct, wch, rows, t):
+    Wd, Hd = wch * 2, rows * 4
+    cx, cy = (Wd - 1) / 2, Hd - 1
+    r = min(Wd / 2 - 1, Hd - 1)
+    bits = [[0] * wch for _ in range(rows)]
+    arc = [[-1.0] * wch for _ in range(rows)]
+    needle = [[False] * wch for _ in range(rows)]
+
+    def put(x, y):
+        x, y = int(round(x)), int(round(y))
+        if 0 <= x < Wd and 0 <= y < Hd:
+            bits[y >> 2][x >> 1] |= BRAILLE_BITS[x % 2][y % 4]
+            return x >> 1, y >> 2
+        return None
+
+    steps = max(120, int(math.pi * r * 3))
+    for k in range(steps + 1):
+        a = math.pi - math.pi * k / steps
+        frac = k / steps
+        for rr in (r - 2, r - 1, r):
+            c = put(cx + rr * math.cos(a), cy - rr * math.sin(a))
+            if c:
+                arc[c[1]][c[0]] = max(arc[c[1]][c[0]], frac)
+    na = math.pi - max(0.0, min(100.0, pct)) / 100 * math.pi
+    k = 0.0
+    while k <= r - 4:
+        c = put(cx + k * math.cos(na), cy - k * math.sin(na))
+        if c:
+            needle[c[1]][c[0]] = True
+        k += 0.5
+    pal, p = t.p["palette"], pct / 100
+    out = []
+    for ri in range(rows):
+        line = []
+        for ci in range(wch):
+            b = bits[ri][ci]
+            ch = chr(0x2800 + b) if b else " "
+            if needle[ri][ci]:
+                line.append(t.c("text", ch))
+            elif arc[ri][ci] < 0:
+                line.append(ch)
+            elif arc[ri][ci] <= p:
+                line.append(_cell(ch, pal[min(len(pal) - 1, int(arc[ri][ci] * len(pal)))]))
+            else:
+                line.append(t.c("dim", ch))
+        out.append("".join(line))
+    return out
+
+
+def _gauges_view(app, data, W, H, show_ms, paused):
+    t = app.theme
+    cw = W - 4
+    n = 3 if cw >= 60 else 2 if cw >= 40 else 1
+    gw = min(28, (cw - 2 - 3 * (n - 1)) // n)
+    rows = 7 if H >= 24 else 5 if H >= 18 else 4
+    now_s, peak, _ = _speed_now(data)
+    scale = max(100, int(math.ceil(max(peak, now_s) * 1.2 / 100.0)) * 100)
+    g = []
+    for label, key, title in (("5h", "five_hour", "ОКНО 5 ЧАСОВ"), ("7d", "seven_day", "НЕДЕЛЯ")):
+        info = lim_info(data, label, key)
+        if not info or info["expired"]:
+            g.append((0, "—", title, "нет данных" if not info else "окно сброшено", "dim", "100"))
+            continue
+        sub = f"↻ {human_left(info['rem'] or 0)}"
+        if info["proj"] is not None:
+            sub += f"  → {min(999, info['proj']):.0f}%"
+        g.append((info["used"], f"{info['used']:.0f}%", title, sub, pct_color(info["used"]), "100"))
+    g.append((now_s / scale * 100, f"{now_s:.0f}", "TOK/S", f"пик {peak:.0f}", "green", str(scale)))
+    g = g[:n]
+    drawn = [braille_gauge(x[0], gw, rows, t) for x in g]
+    sep = "   "
+    body = [""]
+    for r in range(rows):
+        body.append("  " + sep.join(d[r] for d in drawn))
+    body.append("  " + sep.join(_fitw(t.c("dim", "0") + " " * (gw - 1 - len(x[5])) + t.c("dim", x[5]), gw) for x in g))
+    body.append("  " + sep.join(_fitw(_center(t.c(x[4], x[1]), gw), gw) for x in g))
+    body.append("  " + sep.join(_fitw(_center(t.c("text", x[2]), gw), gw) for x in g))
+    body.append("  " + sep.join(_fitw(_center(t.c("dim", x[3]), gw), gw) for x in g))
+    body.append("")
+    ctot = (data.get("claude") or {}).get("totals") or {}
+    otot = (data.get("opencode") or {}).get("today") or {}
+    total = next((p for nm, p in data["pcts"] if nm == "cpu"), 0.0) or 0.0
+    line = (f"  {t.c('dim', 'Claude')} {t.c('yellow', f'≈${float(ctot.get('cost_api') or 0):.2f}')}"
+            f"  {t.c('dim', 'opencode')} {t.c('green', f'${float(otot.get('cost') or 0):.3f}')}"
+            f"  {t.c('dim', 'CPU')} {t.c(pct_color(total), f'{total:.0f}%')}")
+    if data.get("temp"):
+        line += f"  {t.c(temp_color(data['temp']), f'{data['temp']:.0f}°C')}"
+    body.append(line)
+    return _framed(app, data, W, H, show_ms, paused, body)
+
+
+# ── fuel: лимит как бензобак ──
+def _fuel_view(app, data, W, H, show_ms, paused):
+    t = app.theme
+    cw = W - 4
+    info = lim_info(data, "5h", "five_hour")
+    body = [head(t, cw, "ТОПЛИВО · ОКНО 5 ЧАСОВ")]
+    if not info or info["expired"]:
+        body.append("  " + _no_limits(t, info))
+    else:
+        left = max(0.0, 100 - info["used"])
+        cells = max(6, min(14, (cw - 26) // 3))
+        filled = round(left / 100 * cells)
+        col = "green" if left > 50 else "yellow" if left > 20 else "red"
+        row = t.c("dim", "  ┃") + "".join(t.c(col, "██ ") if i < filled else t.c("dim", "░░ ") for i in range(cells)) + t.c("dim", "┃█")
+        body.append(t.c("dim", "  ┏" + "━" * (cells * 3) + "┓"))
+        body.append(row + f"   {t.c(col, f'{left:.0f}%')} {t.c('dim', 'осталось')}")
+        body.append(row + f"   {t.c('dim', '↻')} {human_left(info['rem'] or 0)}")
+        body.append(t.c("dim", "  ┗" + "━" * (cells * 3) + "┛"))
+        if info["rate"]:
+            secs = left / info["rate"]
+            body.append(f"  {t.c('dim', 'запас')}  {t.c('text', human_left(secs))} {t.c('dim', 'работы при расходе')} {info['rate'] * 3600:.0f}%/ч")
+            if secs >= (info["rem"] or 0):
+                body.append("  " + t.c("green", "бак заправится сбросом раньше, чем опустеет"))
+            else:
+                body.append("  " + t.c("red", f"опустеет за {human_left((info['rem'] or 0) - secs)} до сброса — сбавьте темп"))
+        else:
+            body.append("  " + t.c("dim", "запас: считаю расход, нужно 10 минут журнала"))
+    w7 = lim_info(data, "7d", "seven_day")
+    body.append("")
+    if w7 and not w7["expired"]:
+        f7 = round((100 - w7["used"]) / 100 * 20)
+        body.append(f"  {t.c('dim', 'неделя ▕')}" + t.c("green", "█" * f7) + t.c("dim", "░" * (20 - f7) + "▏")
+                    + f" {100 - w7['used']:.0f}% " + t.c("dim", f" ↻ {human_left(w7['rem'] or 0)}"))
+    ctot = (data.get("claude") or {}).get("totals") or {}
+    otot = (data.get("opencode") or {}).get("today") or {}
+    toks = int(ctot.get("output", 0)) + int(otot.get("output", 0)) + int(otot.get("reasoning", 0))
+    odo = "".join(t.c("dim", "│") + t.c("text", ch) for ch in f"{toks:08d}"[-8:])
+    cost = float(ctot.get("cost_api") or 0) + float(otot.get("cost") or 0)
+    body.append(f"  {t.c('dim', 'пробег сегодня')} {odo}{t.c('dim', '│ токенов')}  {t.c('yellow', f'≈${cost:.2f}')}")
+    now_s, _, buckets = _speed_now(data)
+    body.append(f"  {t.c('dim', 'скорость')}       {t.c('green', f'{now_s:.0f} tok/s')} {sparkline(buckets, t, 'gradient', 24)}")
+    return _framed(app, data, W, H, show_ms, paused, body)
+
+
+# ── brief: сводка словами ──
+def _ru_num(n):
+    n = float(n or 0)
+    if n >= 1e6:
+        return f"{n / 1e6:.1f}".replace(".", ",") + " млн"
+    if n >= 1e3:
+        return f"{n / 1e3:.0f} тыс."
+    return f"{n:.0f}"
+
+
+def _weekday_phrase(ts):
+    d = datetime.fromtimestamp(ts)
+    name = WEEKDAYS_ACC[d.weekday()]
+    return ("во " if name == "вторник" else "в ") + name + " в " + d.strftime("%H:%M")
+
+
+def brief_lines(data, t):
+    out = []
+    info = lim_info(data, "5h", "five_hour")
+    if not info:
+        out.append("Данных о лимитах Claude пока нет.")
+    elif info["expired"]:
+        out.append("Окно 5 часов уже сброшено, жду свежие данные.")
+    else:
+        out.append(f"Окно 5 часов заполнено на {t.c(pct_color(info['used']), f'{info['used']:.0f}%')}. "
+                   f"Сбросится в {t.c('text', hhmm(info['reset']))}, через {t.c('text', human_left(info['rem'] or 0))}.")
+        if info["rate"]:
+            out.append(f"Темп последних 30 минут: {t.c('text', f'{info['rate'] * 3600:.0f}% в час')}.")
+            if info["proj"] >= 100:
+                end = time.time() + (100 - info["used"]) / info["rate"]
+                out.append(t.c("red", f"Лимит закончится примерно в {hhmm(end)}, за {human_left(info['reset'] - end)} до сброса."))
+            else:
+                out.append(f"К сбросу будет около {t.c(_proj_color(info['proj']), f'{info['proj']:.0f}%')}: {t.c('green', 'запаса хватит.')}")
+        else:
+            out.append(t.c("dim", "Тренд появится, когда в журнале наберётся 10 минут."))
+    w7 = lim_info(data, "7d", "seven_day")
+    if w7 and not w7["expired"] and w7["reset"]:
+        out.append("")
+        out.append(f"За неделю израсходовано {t.c(pct_color(w7['used']), f'{w7['used']:.1f}%'.replace('.', ','))}. "
+                   f"Новая неделя начнётся {t.c('text', _weekday_phrase(w7['reset']))}.")
+    ctot = (data.get("claude") or {}).get("totals") or {}
+    otot = (data.get("opencode") or {}).get("today") or {}
+    out.append("")
+    out.append(f"Сегодня Claude написал {t.c('text', _ru_num(ctot.get('output')) + ' токенов')}, "
+               f"по ценам API это {t.c('yellow', f'≈${float(ctot.get('cost_api') or 0):.2f}')}.")
+    if otot:
+        out.append(f"opencode: {t.c('text', _ru_num(int(otot.get('output', 0)) + int(otot.get('reasoning', 0))) + ' токенов')} "
+                   f"за {t.c('green', f'${float(otot.get('cost') or 0):.2f}')}.")
+    now_s, _, _ = _speed_now(data)
+    out.append(f"Сейчас идёт {t.c('green', f'{now_s:.0f} токенов в секунду')}.")
+    total = next((p for nm, p in data["pcts"] if nm == "cpu"), 0.0) or 0.0
+    temp = data.get("temp") or 0
+    calm = total < 50 and temp < 75
+    line = (f"Ноутбук {t.c('green' if calm else 'yellow', 'спокоен' if calm else 'нагружен')}: "
+            f"процессор {t.c('text', f'{total:.0f}%')}")
+    if temp:
+        line += f", {t.c(temp_color(temp), f'{temp:.0f} °C')}"
+    bat = data.get("bat") or {}
+    if bat.get("cap") is not None:
+        line += f", батарея {t.c('text', f'{bat['cap']}%')}"
+        if bat.get("power") and bat.get("energy") and not bat.get("ac"):
+            line += f", ещё {t.c('text', human_left(bat['energy'] / abs(bat['power']) * 3600))}"
+    out.append(line + ".")
+    return out
+
+
+def _wrap_ansi(s, w):
+    """Перенос строки с цветами по словам."""
+    if vlen(s) <= w:
+        return [s]
+    words, lines, cur = s.split(" "), [], ""
+    for wd in words:
+        cand = (cur + " " + wd) if cur else wd
+        if vlen(cand) > w and cur:
+            lines.append(cur)
+            cur = wd
+        else:
+            cur = cand
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+def _brief_view(app, data, W, H, show_ms, paused):
+    t = app.theme
+    cw = W - 4
+    body = [head(t, cw, "СВОДКА"), ""]
+    for ln in brief_lines(data, t):
+        for part in _wrap_ansi(ln, cw - 4):
+            body.append("  " + part)
+    return _framed(app, data, W, H, show_ms, paused, body)
+
+
+# ── feed: лента ответов моделей ──
+def opencode_feed(limit=80, window=6 * 3600):
+    db = _oc_db()
+    if not db.exists():
+        return []
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=3)
+        rows = con.execute(
+            "select time_created, data from session_message where type='assistant' "
+            "and time_created>=? order by time_created desc limit ?",
+            (int((time.time() - window) * 1000), limit)).fetchall()
+        con.close()
+    except Exception:
+        return []
+    out = []
+    for ts, raw in rows:
+        try:
+            d = json.loads(raw)
+        except Exception:
+            continue
+        tk = d.get("tokens") or {}
+        tok = int(tk.get("output") or 0) + int(tk.get("reasoning") or 0)
+        if not tok:
+            continue
+        out.append({"ts": ts / 1000.0, "model": (d.get("model") or {}).get("id") or "?",
+                    "out": tok, "cache": int((tk.get("cache") or {}).get("read") or 0),
+                    "cost": float(d.get("cost") or 0), "api": False})
+    return out
+
+
+def _feed_view(app, data, W, H, show_ms, paused):
+    t = app.theme
+    cw = W - 4
+    events = list(getattr(app.speed.claude, "feed", [])) + list(app.cache.get("oc_feed") or [])
+    events.sort(key=lambda e: e["ts"])
+    room = max(3, H - 7)
+    rows = events[-room:]
+    info = lim_info(data, "5h", "five_hour")
+    tick = f"  {t.c('accent', '5h')} "
+    tick += (t.c(pct_color(info["used"]), f"{info['used']:.0f}%") + t.c("dim", f" ↻{human_left(info['rem'] or 0)}")
+             + (t.c("dim", f" →{min(999, info['proj']):.0f}%") if info["proj"] is not None else "")) if info and not info["expired"] else t.c("dim", "—")
+    now_s, _, _ = _speed_now(data)
+    tick += f"  {t.c('dim', '│')}  {t.c('green', f'{now_s:.0f} tok/s')}"
+    ctot = (data.get("claude") or {}).get("totals") or {}
+    tick += f"  {t.c('dim', '│  Claude')} {t.c('yellow', f'≈${float(ctot.get('cost_api') or 0):.2f}')}"
+    body = [tick, t.c("dim", "─" * cw)]
+    if not rows:
+        body.append("  " + t.c("dim", "ответов моделей пока нет — лента наполнится, когда агент начнёт работать"))
+    mx = max([e["out"] for e in rows] or [1])
+    nw = 16 if cw >= 90 else 12
+    for i, e in enumerate(rows):
+        old = i < len(rows) - 8
+        mc = "dim" if old else ("accent" if e.get("api") else "blue")
+        price = (t.c("dim" if old else "yellow", f"≈${e['cost']:.3f}") if e.get("api")
+                 else t.c("dim" if old else "green", f"${e['cost']:.4f}"))
+        line = (f"  {t.c('dim', datetime.fromtimestamp(e['ts']).strftime('%H:%M:%S'))}  {t.c(mc, '●')} "
+                f"{t.c('dim' if old else 'text', pad(short_model(e['model'], nw), nw))} "
+                f"{t.c('dim', '+')}{fmt_tokens(e['out']):>6} {t.c('dim', 'out')}")
+        if cw >= 80:
+            line += f"  {t.c('dim', pad('cache ' + fmt_tokens(e['cache']), 13))}"
+        line += f" {pad(price, 9)}"
+        if cw >= 90:
+            line += "  " + t.c(mc, "▇" * max(1, round(e["out"] / mx * 14)))
+        body.append(line)
+    body.append(t.c("dim", "─" * cw))
+    if rows:
+        top = max(rows, key=lambda e: e["cost"])
+        body.append(f"  {t.c('dim', 'в ленте')} {len(rows)} {t.c('dim', 'ответов · самый дорогой')} "
+                    f"{datetime.fromtimestamp(top['ts']).strftime('%H:%M:%S')} {short_model(top['model'])}")
+    return _framed(app, data, W, H, show_ms, paused, body)
+
+
+# ── week: тепловая карта 7×24 ──
+WEEK_CACHE = CACHE_DIR / "week.json"
+
+
+def week_activity():
+    """Выходные токены по часам за 7 дней (Claude Code + opencode)."""
+    now = datetime.now().astimezone()
+    day0 = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    start = day0.timestamp() - 6 * 86400
+    grid = [[0] * 24 for _ in range(7)]
+
+    def add(ts, tok):
+        di = int((ts - start) // 86400)
+        if 0 <= di < 7:
+            grid[di][datetime.fromtimestamp(ts).hour] += tok
+
+    seen = set()
+    for path in glob.glob(str(HOME / ".claude/projects/**/*.jsonl"), recursive=True):
+        try:
+            if os.path.getmtime(path) < start:
+                continue
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if '"usage"' not in line or '"assistant"' not in line:
+                        continue
+                    try:
+                        d = json.loads(line)
+                        msg = d.get("message") or {}
+                        key = (d.get("requestId") or "", msg.get("id") or d.get("uuid"))
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        ts = datetime.fromisoformat(d["timestamp"].replace("Z", "+00:00")).timestamp()
+                        add(ts, int((msg.get("usage") or {}).get("output_tokens") or 0))
+                    except Exception:
+                        continue
+        except OSError:
+            continue
+    db = _oc_db()
+    if db.exists():
+        try:
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=3)
+            for ts, raw in con.execute("select time_created, data from session_message "
+                                       "where type='assistant' and time_created>=?", (int(start * 1000),)):
+                try:
+                    tk = json.loads(raw).get("tokens") or {}
+                    add(ts / 1000.0, int(tk.get("output") or 0) + int(tk.get("reasoning") or 0))
+                except Exception:
+                    continue
+            con.close()
+        except Exception:
+            pass
+    res = {"ts": time.time(), "start": start, "grid": grid}
+    try:
+        tmp = WEEK_CACHE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(res))
+        tmp.replace(WEEK_CACHE)
+    except OSError:
+        pass
+    return res
+
+
+def _week_view(app, data, W, H, show_ms, paused):
+    t = app.theme
+    cw = W - 4
+    wk = app.cache.get("week")
+    body = [head(t, cw, "НЕДЕЛЯ · ТОКЕНЫ ПО ЧАСАМ")]
+    if not wk:
+        body += ["", "  " + t.c("dim", "считаю активность за 7 дней по логам Claude Code и opencode…")]
+        return _framed(app, data, W, H, show_ms, paused, body)
+    grid, start = wk["grid"], wk["start"]
+    cellw = 2 if cw >= 70 else 1
+    hdr = "      " + "".join((f"{h:02d}" if h % 6 == 0 else "  ")[:cellw] if cellw == 1 else (f"{h:02d}" if h % 6 == 0 else "  ") for h in range(24))
+    body += ["", t.c("dim", hdr)]
+    flat = [v for row in grid for v in row]
+    mx = max(flat) or 1
+    pal = t.p["palette"]
+    totals = [sum(r) for r in grid]
+    tmax = max(totals) or 1
+    now = datetime.now()
+    for di in range(7):
+        ts = start + di * 86400
+        d = datetime.fromtimestamp(ts)
+        today = d.date() == now.date()
+        line = "  " + t.c("accent" if today else "text", WEEKDAYS_SHORT[d.weekday()]) + (t.c("accent", " ▸") if today else "  ")
+        for h in range(24):
+            v = grid[di][h]
+            if today and h > now.hour:
+                line += " " * cellw
+            elif v <= mx * 0.02:
+                line += t.c("dim", "·".ljust(cellw))
+            else:
+                k = v / mx
+                line += _cell("■", pal[min(len(pal) - 1, int(k * len(pal)))]) + " " * (cellw - 1)
+        if cw >= 60:
+            line += " " + t.bar(totals[di] / tmax * 100, 8) + f" {fmt_tokens(totals[di]):>6}"
+        body.append(line)
+    body.append("")
+    di, hh = max(((i, h) for i in range(7) for h in range(24)), key=lambda x: grid[x[0]][x[1]])
+    legend = "  " + t.c("dim", "меньше ") + " ".join(_cell("■", c) for c in pal) + t.c("dim", " больше")
+    if grid[di][hh]:
+        legend += t.c("dim", "   самый плотный час: ") + WEEKDAYS_SHORT[datetime.fromtimestamp(start + di * 86400).weekday()].lower() + f" {hh:02d}:00"
+    body.append(legend)
+    w7 = lim_info(data, "7d", "seven_day")
+    if w7 and not w7["expired"]:
+        body.append(f"  {t.c('dim', 'недельный лимит')} {t.c(pct_color(w7['used']), f'{w7['used']:.1f}%')} "
+                    f"{t.c('dim', f'· в среднем {fmt_tokens(sum(totals) / 7)} токенов в день · ↻ {human_left(w7['rem'] or 0)}')}")
+    return _framed(app, data, W, H, show_ms, paused, body)
+
+
+# ── tiles: плитки в рамках ──
+def _box(t, title, lines, w, sev=None):
+    bc = sev or "dim"
+    inner = w - 4
+    top = t.c(bc, "╭─ ") + t.c("text", title) + t.c(bc, " " + "─" * max(1, w - vlen(title) - 5) + "╮")
+    out = [top] + [t.c(bc, "│ ") + _fitw(x, inner) + t.c(bc, " │") for x in lines]
+    out.append(t.c(bc, "╰" + "─" * (w - 2) + "╯"))
+    return out
+
+
+def _tiles_view(app, data, W, H, show_ms, paused):
+    t = app.theme
+    n = 3 if W >= 96 else 2 if W >= 64 else 1
+    bw = (W - (n - 1)) // n
+    iw = bw - 4
+    bars = max(6, iw - 14)
+    i5, i7 = lim_info(data, "5h", "five_hour"), lim_info(data, "7d", "seven_day")
+
+    def lim_rows(info, label):
+        if not info or info["expired"]:
+            return [f"{t.c('text', label)} " + _no_limits(t, info)]
+        r = [f"{t.c('text', label)} {t.bar(info['used'], bars)} {t.c(pct_color(info['used']), f'{info['used']:>3.0f}%')}"]
+        sub = f"   {t.c('dim', '↻')} {human_left(info['rem'] or 0)}"
+        if info["proj"] is not None:
+            sub += f"  {t.c('dim', '→')} {t.c(_proj_color(info['proj']), f'{min(999, info['proj']):.0f}%')}"
+        return r + [sub]
+
+    now_s, peak, buckets = _speed_now(data)
+    ctot = (data.get("claude") or {}).get("totals") or {}
+    otot = (data.get("opencode") or {}).get("today") or {}
+    total = next((p for nm, p in data["pcts"] if nm == "cpu"), 0.0) or 0.0
+    cores = [p or 0.0 for nm, p in data["pcts"] if nm != "cpu"]
+    pal = t.p["palette"]
+    sq = "".join(_cell("■", pal[0] if c < 25 else pal[1] if c < 50 else t.p["yellow"] if c < 75 else t.p["red"]) for c in cores)
+    mem = data.get("mem")
+    mp = (mem[1] / mem[0] * 100) if mem and mem[0] else 0
+    temp = data.get("temp") or 0
+    bat = data.get("bat") or {}
+    net = data.get("net") or (0, 0)
+    disk = data.get("disk") or (0, 0)
+    sev5 = pct_color(i5["used"]) if i5 and not i5["expired"] else None
+    boxes = [
+        ("ЛИМИТЫ", lim_rows(i5, "5h") + lim_rows(i7, "7d"), sev5),
+        ("ТОКЕНЫ", [f"{t.c('dim', 'tok/s')} {t.c('green', f'{now_s:.1f}')}  {t.c('dim', 'пик')} {peak:.0f}",
+                    sparkline(buckets, t, "gradient", iw),
+                    f"{t.c('accent', 'Claude')} {t.c('dim', 'out')} {fmt_tokens(ctot.get('output', 0))}  {t.c('yellow', f'≈${float(ctot.get('cost_api') or 0):.2f}')}",
+                    f"{t.c('blue', 'oc')}     {t.c('dim', 'out')} {fmt_tokens(int(otot.get('output', 0)) + int(otot.get('reasoning', 0)))}  {t.c('green', f'${float(otot.get('cost') or 0):.3f}')}"], None),
+        ("МОДЕЛИ", models_lines(data.get("claude"), data.get("opencode"), t, iw + 2, limit=4), None),
+        ("CPU", [f"{t.c(pct_color(total), f'{total:>3.0f}%')}  {sparkline(data['hist_cpu'], t, 'gradient', iw - 6)}",
+                 f"{t.c('dim', 'ядра')} {sq}",
+                 f"{t.c('dim', 'load')} {data['load'][0]:.2f} {data['load'][1]:.2f} {data['load'][2]:.2f}"]
+         + ([f"{t.c('dim', 'топ')}  {data['procs'][0][2][:12]} {data['procs'][0][0]:.0f}%"] if data.get("procs") else []), None),
+        ("ПАМЯТЬ · ТЕМП", [f"{t.c('text', 'RAM')} {t.bar(mp, bars)} {mp:>3.0f}%"]
+         + ([f"{t.c('text', 'Tct')} {t.bar(max(0, min(100, (temp - 30) / 60 * 100)), bars)} {t.c(temp_color(temp), f'{temp:.0f}°C')}"] if temp else [])
+         + ([f"{t.c('text', 'GPU')} {t.bar(data['gpu'], bars)} {data['gpu']:>3.0f}%"] if data.get("gpu") is not None else [])
+         + ([f"{t.c('text', 'BAT')} {t.bar(bat['cap'], bars)} {bat['cap']:>3}%"] if bat.get("cap") is not None else []),
+         (temp_color(temp) if temp and temp_color(temp) != "green" else None)),
+        ("СЕТЬ · ДИСК", [f"{t.c('green', '↓')} {fmt_bytes(net[0])}/s  {t.c('blue', '↑')} {fmt_bytes(net[1])}/s",
+                         sparkline(data["hist_io"], t, "gradient", iw),
+                         f"{t.c('dim', 'disk')} r {fmt_bytes(disk[0])}/s  w {fmt_bytes(disk[1])}/s",
+                         f"{t.c('dim', 'iface')} {data.get('iface') or '?'}"], None),
+    ]
+    rendered = [_box(t, title, lines, bw, sev) for title, lines, sev in boxes]
+    worst = max([x["used"] for x in (i5, i7) if x and not x["expired"]] or [0])
+    ts = datetime.now().strftime("%H:%M:%S.%f")[:-4] if show_ms else datetime.now().strftime("%H:%M:%S")
+    out = [f"{t.c(pct_color(worst), '●')} {t.c('accent', 'AGENTOP')} {t.c('dim', VERSION + ' · tiles · ' + t.name + ' · ' + ts)}"]
+    for i in range(0, len(rendered), n):
+        grp = rendered[i:i + n]
+        h = max(len(b) for b in grp)
+        for r in range(h):
+            out.append(" ".join(_fitw(b[r] if r < len(b) else "", bw) for b in grp))
+    hint = (f"{key(t, 'r')} обновить  {key(t, 't')} тема  {key(t, 'v')} вид  {key(t, 'd')} задачи  "
+            f"{key(t, 's')} настройки  {key(t, 'p')} пауза  {key(t, 'q')} выход")
+    out = out[:max(1, H - 1)] + [hint]
+    return [clip(x, W) for x in out]
+
+
+# ── cockpit: крупные цифры ──
+def _cockpit_view(app, data, W, H, show_ms, paused):
+    t = app.theme
+    cw = W - 4
+    half = (cw - 5) // 2
+    body = [""]
+
+    def blk(label, key, title):
+        info = lim_info(data, label, key)
+        if not info or info["expired"]:
+            return [t.c("dim", title), "", "  " + _no_limits(t, info), "", ""]
+        big = big_text(f"{info['used']:.0f}%")
+        col = pct_color(info["used"])
+        side = [f"{t.c('dim', '↻')} {human_left(info['rem'] or 0)}",
+                (f"{t.c('dim', 'тренд')} {info['rate'] * 3600:.0f}%/ч" if info["rate"] is not None else t.c("dim", "лимит")),
+                (f"{t.c('dim', '→')} {t.c(_proj_color(info['proj']), f'{min(999, info['proj']):.0f}% к сбросу')}"
+                 if info["proj"] is not None else t.c("dim", f"{100 - info['used']:.0f}% осталось"))]
+        rows = [t.c("dim", title)]
+        rows += [t.c(col, big[r]) + "   " + side[r] for r in range(3)]
+        rows.append(t.bar(info["used"], max(8, half - 2)))
+        return rows
+
+    a = blk("5h", "five_hour", "5 ЧАСОВ")
+    b = blk("7d", "seven_day", "7 ДНЕЙ")
+    if cw >= 60:
+        for i in range(max(len(a), len(b))):
+            body.append("  " + _fitw(a[i] if i < len(a) else "", half) + "   " + (b[i] if i < len(b) else ""))
+    else:
+        body += ["  " + x for x in a] + [""] + ["  " + x for x in b]
+    body.append("")
+    now_s, _, buckets = _speed_now(data)
+    ctot = (data.get("claude") or {}).get("totals") or {}
+    otot = (data.get("opencode") or {}).get("today") or {}
+    total = next((p for nm, p in data["pcts"] if nm == "cpu"), 0.0) or 0.0
+    body.append(f"  {t.c('dim', 'tok/s')} {t.c('green', f'{now_s:.0f}')} {sparkline(buckets, t, 'gradient', 14)}"
+                f"   {t.c('dim', 'Claude')} {t.c('yellow', f'≈${float(ctot.get('cost_api') or 0):.2f}')}"
+                f"   {t.c('dim', 'opencode')} {t.c('green', f'${float(otot.get('cost') or 0):.2f}')}"
+                f"   {t.c('dim', 'CPU')} {t.c(pct_color(total), f'{total:.0f}%')}")
+    return _framed(app, data, W, H, show_ms, paused, body)
+
+
+# ── sidebar: узкая колонка (включается сама на узких терминалах) ──
+def _sidebar_view(app, data, W, H, show_ms, paused):
+    t = app.theme
+    w = max(24, W)
+    bw = max(6, w - 16)
+
+    def sep(title):
+        return t.c("accent", "▐ ") + t.c("text", title + " ") + t.c("dim", "─" * max(0, w - len(title) - 3))
+
+    i5, i7 = lim_info(data, "5h", "five_hour"), lim_info(data, "7d", "seven_day")
+    worst = max([x["used"] for x in (i5, i7) if x and not x["expired"]] or [0])
+    ts = datetime.now().strftime("%H:%M:%S")
+    out = [t.c(pct_color(worst), "● ") + t.c("accent", "AGENTOP") + " " * max(1, w - 10 - len(ts)) + t.c("dim", ts), "", sep("ЛИМИТЫ")]
+    for info, label in ((i5, "5h"), (i7, "7d")):
+        if not info or info["expired"]:
+            out.append(f"{t.c('text', label)} " + _no_limits(t, info))
+            continue
+        out.append(f"{t.c('text', label)} {t.bar(info['used'], bw)} {t.c(pct_color(info['used']), f'{info['used']:>3.0f}%')}")
+        sub = f"   {t.c('dim', '↻')}{human_left(info['rem'] or 0)}"
+        if info["proj"] is not None:
+            sub += f" {t.c('dim', '→')}{t.c(_proj_color(info['proj']), f'{min(999, info['proj']):.0f}%')}"
+        out.append(sub)
+        if label == "5h" and info["pts"]:
+            out.append("   " + sparkline([u for _, u in info["pts"]] + [info["used"]], t, "gradient", w - 4))
+    now_s, _, buckets = _speed_now(data)
+    ctot = (data.get("claude") or {}).get("totals") or {}
+    otot = (data.get("opencode") or {}).get("today") or {}
+    out += ["", sep("ТОКЕНЫ"),
+            f"{t.c('dim', 'tok/s')} {t.c('green', f'{now_s:<4.0f}')} {sparkline(buckets, t, 'gradient', max(4, w - 12))}",
+            f"{t.c('accent', 'Claude')} {t.c('yellow', f'≈${float(ctot.get('cost_api') or 0):.2f}')}",
+            f"{t.c('blue', 'oc')}     {t.c('green', f'${float(otot.get('cost') or 0):.2f}')}"]
+    total = next((p for nm, p in data["pcts"] if nm == "cpu"), 0.0) or 0.0
+    mem = data.get("mem")
+    mp = (mem[1] / mem[0] * 100) if mem and mem[0] else 0
+    temp = data.get("temp") or 0
+    bat = data.get("bat") or {}
+    out += ["", sep("СИСТЕМА"),
+            f"{t.c('text', 'CPU')} {t.c(pct_color(total), f'{total:>3.0f}%')} {sparkline(data['hist_cpu'], t, 'gradient', max(4, w - 10))}",
+            f"{t.c('text', 'RAM')} {mp:>3.0f}%" + (f"  {t.c(temp_color(temp), f'{temp:.0f}°C')}" if temp else "")
+            + (f"  {t.c('dim', 'BAT')} {bat['cap']}%" if bat.get("cap") is not None else "")]
+    out.append("")
+    out.append(f"{key(t, 'v')} {t.c('dim', 'вид')} {key(t, 'd')} {t.c('dim', 'задачи')} {key(t, 'q')} {t.c('dim', 'выход')}")
+    return [clip(x, W) for x in out[:H]]
+
+
+# ── beacon: всё окно цвета состояния ──
+BEACON = {"green": (22, 151), "yellow": (58, 223), "red": (52, 211), "dim": (236, 250)}
+
+
+def _beacon_view(app, data, W, H, show_ms, paused):
+    info = lim_info(data, "5h", "five_hour")
+    if info and not info["expired"]:
+        state, big = pct_color(info["used"]), big_text(f"{info['used']:.0f}%", wide=W >= 40)
+        sub = f"ОКНО 5 ЧАСОВ  ·  ↻ {human_left(info['rem'] or 0)}"
+    else:
+        state, big = "dim", big_text("--", wide=W >= 40)
+        sub = "нет данных о лимитах" if not info else "окно сброшено"
+    bg, fg = BEACON[state]
+    w7 = lim_info(data, "7d", "seven_day")
+    now_s, _, _ = _speed_now(data)
+    small = f"неделя {w7['used']:.0f}%  ·  " if w7 and not w7["expired"] else ""
+    small += f"{now_s:.0f} tok/s  ·  {datetime.now().strftime('%H:%M')}"
+    content = big + ["", sub, "", small]
+    top = max(0, (H - len(content) - 1) // 2)
+    lines = [""] * top + content
+    lines = lines + [""] * max(0, H - 1 - len(lines))
+    lines = lines[:max(1, H - 1)] + ["[v] вид  [d] задачи  [q] выход"]
+    out = []
+    for i, ln in enumerate(lines):
+        txt = _center(ln, W)[:W]
+        txt = txt + " " * (W - len(txt))
+        if COLOR:
+            fgc = fg if i < len(lines) - 1 else 245
+            out.append(f"\033[48;5;{bg}m\033[38;5;{fgc}m{txt}\033[0m")
+        else:
+            out.append(txt)
+    return out
+
+
+# ── tasks: диспетчер задач ──
+def _tasks_view(app, data, W, H, show_ms, paused):
+    t = app.theme
+    st = app.tasks
+    cw = W - 4
+    procs = data.get("tasks") or []
+    st.rows = task_rows(procs, st)
+    n = len(st.rows)
+    st.sel = max(0, min(st.sel, n - 1)) if n else 0
+    total = next((p for nm, p in data["pcts"] if nm == "cpu"), 0.0) or 0.0
+    mem = data.get("mem")
+    arrow = "▼" if st.desc else "▲"
+    summary = (f"  {t.c('dim', 'процессов')} {len(procs)}"
+               + (f" {t.c('dim', '· групп')} {n}" if st.group else "")
+               + f"  {t.c('dim', '· CPU')} {t.c(pct_color(total), f'{total:.0f}%')}")
+    if mem:
+        summary += f"  {t.c('dim', '· RAM')} {mem[1]:.1f}/{mem[0]:.1f}G"
+    summary += f"  {t.c('dim', '· сортировка')} {TASK_SORT_LABEL[st.sort]} {arrow}"
+    if st.typing or st.filter:
+        summary += f"  {t.c('dim', '· поиск')} {t.c('yellow', st.filter + ('▏' if st.typing else ''))}"
+    wide = cw >= 90
+    cnt_head = " КОЛ" if st.group else " ПОТ"
+    colhead = f"  {'PID':>7}  {pad('ПОЛЬЗ.', 9)}{'CPU%':>6} {'ПАМЯТЬ':>8}{cnt_head:>5}  "
+    colhead += ("НАГРУЗКА  " if wide else "") + "ИМЯ"
+    reserve = 3 + 3 + 1  # шапка, сводка, заголовок колонок / сообщения / подвал
+    room = max(3, H - reserve - 2)
+    st.page = room
+    if st.sel < st.top:
+        st.top = st.sel
+    elif st.sel >= st.top + room:
+        st.top = st.sel - room + 1
+    st.top = max(0, min(st.top, max(0, n - room)))
+    body = [summary, t.c("dim", colhead)]
+    for i in range(st.top, min(n, st.top + room)):
+        r = st.rows[i]
+        sel = i == st.sel
+        cnt = len(r["pids"]) if st.group else r["threads"]
+        name = r["name"] + (f"  {t.c('dim', '×' + str(cnt))}" if st.group and cnt > 1 else "")
+        cpu_s = t.c(pct_color(min(100, r["cpu"])), f"{r['cpu']:>6.1f}")
+        line = (f"{t.c('accent', '›') if sel else ' '} {t.c('accent' if sel else 'dim', f'{r['pid']:>7}')}  "
+                f"{pad(clip(r['user'], 9), 9)}{cpu_s} {fmt_bytes(r['rss']):>8}{cnt:>5}  ")
+        if wide:
+            line += t.bar(min(100, r["cpu"]), 8) + "  "
+        line += t.c("accent", r["name"]) + (name[len(r["name"]):]) if sel else name
+        body.append(line)
+    if not n:
+        body.append("  " + t.c("dim", "ничего не найдено" if st.filter else "собираю список процессов…"))
+    while len(body) < room + 2:
+        body.append("")
+    # строка состояния / подтверждение
+    if st.confirm:
+        c = st.confirm
+        cnt = len(c["pids"])
+        what = f"«{c['name']}»" + (f" ({cnt} процессов)" if cnt > 1 else f" (PID {c['pids'][0]})")
+        if c.get("force"):
+            q = f"  {t.c('red', '⚠ Завершить принудительно ' + what + '?')}  {key(t, 'y')} да  {key(t, 'n')} отмена"
+        else:
+            q = (f"  {t.c('yellow', 'Завершить ' + what + '?')}  {key(t, 'y')} завершить  "
+                 f"{key(t, 'K')} принудительно  {key(t, 'n')} отмена")
+        body.append(q)
+        body.append("  " + (t.c("red", "⚠ " + c["risk"]) if c.get("risk") else t.c("dim", "несохранённые данные в приложении могут пропасть")))
+    else:
+        msg = st.message if st.message and time.time() - st.message[2] < 8 else None
+        if msg:
+            body.append("  " + t.c(msg[1] if msg[1] in t.p else "text", msg[0]))
+        elif n:
+            r = st.rows[st.sel]
+            cmd = app.procs.cmdline(r["pid"]) or r["name"]
+            body.append("  " + t.c("dim", f"PID {r['pid']} · {r['user']} · ") + t.c("text", cmd))
+        else:
+            body.append("")
+        body.append("")
+    out = [_header(app, data, W, show_ms)]
+    out += [content_line(t, W, x) for x in body]
+    if st.typing:
+        hint = f"{t.c('dim', 'поиск: печатайте имя или PID')}  {key(t, 'Enter')} готово  {key(t, 'Esc')} сбросить"
+    else:
+        hint = (f"{key(t, '↑↓')} выбор  {key(t, 'x')} завершить  {key(t, 'c/m/n/i')} сортировка  "
+                f"{key(t, 'g')} группы  {key(t, '/')} поиск  {key(t, 'd')} назад  {key(t, 'q')} выход")
+    out.append(frame_bottom(t, W, hint))
+    return [clip(x, W) for x in out[:H]]
+
+
+VIEW_RENDERERS = {
+    "timeline": _timeline_view, "gauges": _gauges_view, "fuel": _fuel_view, "brief": _brief_view,
+    "feed": _feed_view, "week": _week_view, "tiles": _tiles_view, "cockpit": _cockpit_view,
+    "sidebar": _sidebar_view, "beacon": _beacon_view, "tasks": _tasks_view,
+}
+NARROW_OK = {"sidebar", "beacon", "brief", "tasks"}
+
+
 def render(app, data, W, H, show_ms=False, paused=False):
+    if W < 52 and app.view not in NARROW_OK:
+        return _sidebar_view(app, data, W, H, show_ms, paused)
+    if app.view in VIEW_RENDERERS:
+        return VIEW_RENDERERS[app.view](app, data, W, H, show_ms, paused)
     if app.view == "focus":
         return _focus_view(app, data, W, H, show_ms, paused)
     if app.view == "system":
@@ -2341,14 +3592,136 @@ def waybar_out(app, data):
                        "alt": level, "percentage": int(round(worst))}, ensure_ascii=False)
 
 
-def argos_out(app, data):
+PANEL_STYLES = ("text", "forecast", "dot", "cells", "countdown", "pulse", "rotate", "ring", "bars")
+PANEL_HEX = {"critical": "#f38ba8", "warning": "#f9e2af", "good": "#a6e3a1", "dim": "#8d8da0"}
+
+
+def _level(p):
+    return "critical" if p >= 95 else "warning" if p >= 80 else "good"
+
+
+def _png(w, h, rows):
+    """Минимальный PNG RGBA без сторонних библиотек."""
+    raw = b"".join(b"\x00" + bytes(v for px in row for v in px) for row in rows)
+
+    def chunk(tag, data):
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
+
+
+def _hex_rgb(h):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def ring_png(pct, size=32, color="#cba6f7"):
+    """Кольцо-индикатор: заполнено по часовой стрелке от 12 часов, сглаживание 4×4."""
+    fg, cx, ro = _hex_rgb(color), size / 2, size / 2 - 1
+    ri = ro - size * 0.16
+    rows = []
+    for y in range(size):
+        row = []
+        for x in range(size):
+            hit_fg = hit_bg = 0
+            for sy in range(4):
+                for sx in range(4):
+                    px, py = x + (sx + 0.5) / 4 - cx, y + (sy + 0.5) / 4 - cx
+                    d = math.hypot(px, py)
+                    if ri <= d <= ro:
+                        ang = (math.atan2(px, -py) % (2 * math.pi)) / (2 * math.pi)
+                        if ang <= pct / 100:
+                            hit_fg += 1
+                        else:
+                            hit_bg += 1
+            if hit_fg >= hit_bg and hit_fg:
+                row.append(fg + (int(255 * hit_fg / 16),))
+            elif hit_bg:
+                row.append((255, 255, 255, int(70 * hit_bg / 16)))
+            else:
+                row.append((0, 0, 0, 0))
+        rows.append(row)
+    return _png(size, size, rows)
+
+
+def bars_png(a, b, w=28, h=32):
+    """Два столбика: окно 5h и неделя."""
+    rows = [[(0, 0, 0, 0)] * w for _ in range(h)]
+    for x0, p in ((3, a), (16, b)):
+        col = _hex_rgb(PANEL_HEX[_level(p)] if p >= 80 else "#cba6f7")
+        top = h - 2 - round((h - 4) * max(0, min(100, p)) / 100)
+        for y in range(2, h - 2):
+            for x in range(x0, x0 + 9):
+                rows[y][x] = col + (255,) if y >= top else (255, 255, 255, 60)
+    return _png(w, h, rows)
+
+
+def _pango(text, level=None):
+    esc = str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    col = PANEL_HEX.get(level) if level else None
+    return f"<span color='{col}'>{esc}</span>" if col else esc
+
+
+def panel_line(data, style):
+    """Первая строка Argos: (разметка Pango, PNG или None)."""
+    i5, i7 = lim_info(data, "5h", "five_hour"), lim_info(data, "7d", "seven_day")
+    ok5 = i5 and not i5["expired"]
+    ok7 = i7 and not i7["expired"]
+    u5 = i5["used"] if ok5 else None
+    u7 = i7["used"] if ok7 else None
+    worst = max([u for u in (u5, u7) if u is not None] or [0])
+    lvl5 = _level(u5) if u5 is not None else None
+    now_s, _, buckets = _speed_now(data)
+    if u5 is None and style not in ("pulse",):
+        return _pango("claude --" if not i5 else "5h reset", "dim"), None
+    if style == "forecast":
+        p = i5["proj"] if i5["proj"] is not None else u5
+        lv = "critical" if p >= 100 else "warning" if p >= 85 else "good"
+        return "5h " + _pango("→", "dim") + " " + _pango(f"{min(999, p):.0f}%", lv), None
+    if style == "dot":
+        if u5 >= 80:
+            return _pango(f"● 5h {u5:.0f}%", lvl5), None
+        return _pango("●", "good"), None
+    if style == "cells":
+        f = round((100 - u5) / 10)
+        return _pango("▮" * f, lvl5) + _pango("▯" * (10 - f), "dim"), None
+    if style == "countdown":
+        rem = max(0, int(i5["rem"] or 0))
+        return _pango("●", lvl5) + f" ↻ {rem // 3600}:{rem % 3600 // 60:02d}", None
+    if style == "pulse":
+        v = buckets[-6:] or [0]
+        hi = max(v) or 1
+        return _pango("".join(SPARK_CHARS[int(x / hi * 7)] for x in v), "dim") + f" {now_s:.0f} t/s", None
+    if style == "rotate":
+        ctot = (data.get("claude") or {}).get("totals") or {}
+        items = [_pango(f"5h {u5:.0f}%", lvl5 if u5 >= 80 else None),
+                 (f"7d {u7:.0f}%" if u7 is not None else "7d --"),
+                 f"{now_s:.0f} t/s", f"≈${float(ctot.get('cost_api') or 0):.0f}"]
+        return items[int(time.time() // 3) % len(items)], None
+    if style == "ring":
+        col = PANEL_HEX[lvl5] if u5 >= 80 else "#cba6f7"
+        return _pango(f"{u5:.0f}%", lvl5 if u5 >= 80 else None), ring_png(u5, 32, col)
+    if style == "bars":
+        return "", bars_png(u5, u7 if u7 is not None else 0)
+    lv = _level(worst) if worst >= 80 else None
+    return _pango(f"5h {u5:.0f}%" + (f" · 7d {u7:.0f}%" if u7 is not None else ""), lv), None
+
+
+def argos_out(app, data, style=None):
     """Формат Argos/BitBar (расширение «Argos» для верхней панели GNOME)."""
+    style = style or app.cfg.get("panel_style") or "text"
+    if style not in PANEL_STYLES:
+        style = "text"
     text, tips, level, _ = bar_summary(data)
-    color = {"critical": "#f38ba8", "warning": "#f9e2af"}.get(level)
-    first = f"{text} | font=monospace" + (f" color={color}" if color else "")
+    first, png = panel_line(data, style)
+    line = first + " | font=monospace useMarkup=true"
+    if png:
+        line += f" image={base64.b64encode(png).decode()} imageWidth=16 imageHeight=16"
     term = shutil.which("ghostty") and "ghostty -e agentop" or "x-terminal-emulator -e agentop"
-    out = [first, "---"] + [f"{x.replace('|', '/')} | font=monospace" for x in tips]
-    out += ["---", f"Открыть AgentOp | bash='{term}' terminal=false"]
+    out = [line, "---"] + [f"{x.replace('|', '/')} | font=monospace useMarkup=false" for x in tips]
+    out += ["---", f"Открыть AgentOp | bash='{term}' terminal=false",
+            f"Диспетчер задач | bash='{term.replace('-e agentop', '-e agentop --view tasks')}' terminal=false"]
     return "\n".join(out)
 
 
@@ -2377,7 +3750,31 @@ def json_out(app, data):
                    "net": data["net"], "iface": data["iface"],
                    "uptime": data["uptime"]},
         "processes": data["procs"],
+        "panel": panel_json(app, data),
     }, ensure_ascii=False, indent=2)
+
+
+def panel_json(app, data):
+    """Готовые числа для расширения GNOME: окна, тренд, прогноз, история, скорость."""
+    out = {"style": app.cfg.get("panel_style") or "text", "styles": list(PANEL_STYLES),
+           "now": time.time(), "error": (data.get("limits") or {}).get("error")}
+    for label, key, wlen in LIMIT_WINDOWS:
+        info = lim_info(data, label, key)
+        if not info:
+            out[label] = None
+            continue
+        out[label] = {"used": info["used"], "reset": info["reset"], "rem": info["rem"],
+                      "expired": info["expired"], "rate_h": info["rate"] * 3600 if info["rate"] is not None else None,
+                      "proj": info["proj"], "window": wlen,
+                      "history": [[round(a), b] for a, b in info["pts"]][-120:]}
+    now_s, peak, buckets = _speed_now(data)
+    ctot = (data.get("claude") or {}).get("totals") or {}
+    otot = (data.get("opencode") or {}).get("today") or {}
+    out["speed"] = {"now": now_s, "peak": peak, "buckets": buckets}
+    out["claude_cost_api"] = float(ctot.get("cost_api") or 0)
+    out["claude_out"] = int(ctot.get("output") or 0)
+    out["opencode_cost"] = float(otot.get("cost") or 0)
+    return out
 
 
 # ───────────────────────────── main ─────────────────────────────
@@ -2388,6 +3785,9 @@ def main():
     ap.add_argument("--json", action="store_true", help="JSON")
     ap.add_argument("--waybar", action="store_true", help="JSON для модуля custom в Waybar")
     ap.add_argument("--argos", action="store_true", help="вывод для GNOME-расширения Argos")
+    ap.add_argument("--set-panel-style", choices=PANEL_STYLES, help="сохранить стиль индикатора панели")
+    ap.add_argument("--panel-style", choices=PANEL_STYLES,
+                    help="стиль индикатора для --argos: " + ", ".join(PANEL_STYLES))
     ap.add_argument("--refresh", "-r", action="store_true", help="сбросить кэш")
     ap.add_argument("--theme", help="тема на один запуск")
     ap.add_argument("--set-theme", help="сохранить тему в конфиг")
@@ -2415,6 +3815,17 @@ def main():
             "system": "только железо",
             "compact": "компактная одна колонка",
             "minimal": "5–6 строк",
+            "timeline": "ось окна 5h: история, прогноз к сбросу",
+            "gauges": "стрелочные приборы: 5h, неделя, tok/s",
+            "fuel": "лимит как бензобак: на сколько часов хватит",
+            "brief": "сводка словами",
+            "feed": "лента ответов моделей с ценой",
+            "week": "тепловая карта недели 7×24",
+            "tiles": "плитки в рамках, как btop",
+            "cockpit": "крупные цифры для второго монитора",
+            "sidebar": "узкая колонка (включается сама на узких)",
+            "beacon": "всё окно цвета состояния",
+            "tasks": "диспетчер задач: процессы, завершение",
         }
         for v in VIEWS:
             print(f"  {v:10s} {desc[v]}")
@@ -2428,6 +3839,11 @@ def main():
         cfg["theme"] = name
         save_config(cfg)
         print(f"тема сохранена: {name}")
+        return
+
+    if args.set_panel_style:
+        persist_setting("panel_style", args.set_panel_style)
+        print(f"стиль панели сохранён: {args.set_panel_style}")
         return
 
     if args.config:
@@ -2460,8 +3876,8 @@ def main():
     show_ms = bool(args.ms or _as_bool(cfg.get("clock_ms"), False))
 
     size = shutil.get_terminal_size((80, 24))
-    W = max(52, min(size.columns - 1, 120))
-    H = max(20, size.lines)
+    W = max(24, min(size.columns - 1, 120))
+    H = max(12, size.lines)
 
     if one_shot:
         time.sleep(0.35)
@@ -2471,7 +3887,7 @@ def main():
         elif args.waybar:
             print(waybar_out(app, data))
         elif args.argos:
-            print(argos_out(app, data))
+            print(argos_out(app, data, args.panel_style))
         elif args.short:
             print(short(app, data))
         else:
@@ -2510,8 +3926,8 @@ def main():
                 now_s = time.time()
                 if now_s - last_size_check >= 0.5:
                     size = shutil.get_terminal_size((80, 24))
-                    W = max(52, min(size.columns - 1, 120))
-                    H = max(20, size.lines)
+                    W = max(24, min(size.columns - 1, 120))
+                    H = max(12, size.lines)
                     last_size_check = now_s
                 stamp_s = (int(now_s), settings_sel, app.theme.name)
                 if stamp_s != last_settings_stamp:
@@ -2583,8 +3999,8 @@ def main():
             now = tick_start
             if now - last_size_check >= 0.5:
                 size = shutil.get_terminal_size((80, 24))
-                W = max(52, min(size.columns - 1, 120))
-                H = max(20, size.lines)
+                W = max(24, min(size.columns - 1, 120))
+                H = max(12, size.lines)
                 last_size_check = now
 
             if data is None or now - last_sample >= interval:
@@ -2610,11 +4026,30 @@ def main():
             r, _, _ = select.select([fd], [], [], wait)
             if not r:
                 continue
-            ch = read_key(fd)
+            ch = read_key(fd, translate=not (app.view == "tasks" and app.tasks.typing))
             if ch is None:
                 break
-            if ch in ("q", "Q", "\x03", "ESC"):
+            if ch == "\x03":
                 break
+            if app.view == "tasks" and tasks_key(app, ch):
+                last_frame = None
+                last_stamp = None
+                if app.view != "tasks":
+                    cfg["view"] = app.view
+                continue
+            if ch in ("q", "Q", "ESC"):
+                break
+            if ch in ("d", "D"):
+                if app.view == "tasks":
+                    app.view = app.tasks.back_view
+                else:
+                    app.tasks.back_view = app.view
+                    app.view = "tasks"
+                    app.ts.pop("tasks", None)
+                last_sample = 0.0
+                last_frame = None
+                last_stamp = None
+                continue
             if ch in ("r", "R"):
                 clear_cache()
                 app.ts.clear()
@@ -2639,7 +4074,12 @@ def main():
                 last_stamp = None
             elif ch in ("v", "V"):
                 idx = VIEWS.index(app.view) if app.view in VIEWS else 0
-                app.view = VIEWS[(idx + 1) % len(VIEWS)]
+                step = -1 if ch == "V" else 1
+                app.view = VIEWS[(idx + step) % len(VIEWS)]
+                if app.view == "tasks":
+                    app.tasks.back_view = VIEWS[idx]
+                    app.ts.pop("tasks", None)
+                last_sample = 0.0
                 cfg["view"] = app.view
                 persist_setting("view", app.view)
                 last_frame = None

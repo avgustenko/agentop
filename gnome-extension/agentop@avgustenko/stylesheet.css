@@ -1,0 +1,16 @@
+.agentop-indicator { spacing: 6px; }
+.agentop-label { font-family: monospace; font-feature-settings: "tnum"; }
+.agentop-good { color: #a6e3a1; }
+.agentop-warn { color: #f9e2af; }
+.agentop-crit { color: #f38ba8; }
+.agentop-dim { color: #8d8da0; }
+
+.agentop-card { spacing: 10px; padding: 6px 4px; min-width: 330px; }
+.agentop-row { spacing: 12px; }
+.agentop-caption { color: #a9a9b8; font-size: 0.86em; }
+.agentop-big { font-size: 2.1em; font-weight: 700; font-feature-settings: "tnum"; }
+.agentop-mid { font-size: 1.35em; font-weight: 600; font-feature-settings: "tnum"; }
+.agentop-meter { height: 6px; border-radius: 3px; background-color: rgba(255, 255, 255, 0.14); }
+.agentop-meter-fill { height: 6px; border-radius: 3px; background-color: #cba6f7; }
+.agentop-meter-fill.agentop-warn { background-color: #f9e2af; }
+.agentop-meter-fill.agentop-crit { background-color: #f38ba8; }

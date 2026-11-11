@@ -3,7 +3,7 @@
 **A terminal dashboard for AI coding agents** — Claude limits, token spend, token speed and system health in one live TUI. Think `top`, but for your agents + machine.
 
 ```
-╭─ ● AGENTOP 1.3.0 · catppuccin-mocha ─────────────── 15:42:07 · 88% · 46°C · up 30м ─╮
+╭─ ● AGENTOP 1.4.0 · catppuccin-mocha ─────────────── 15:42:07 · 88% · 46°C · up 30м ─╮
 │ ▐ LIMITS ───────────────────────────────────── │ ▐ CPU ────────────────────────────────────── │
 │   5h  ░░░░░░░░░░░░ 0.000%  ↻ 4ч 32м            │   total ██░░░░░░░░░░  15%  ▁                  │
 │   7d  ███░░░░░░░░░ 23.000%  ↻ 14ч 02м          │   C0 █████ 100  C1 ░░░░░   2  C2 ░░░░░   9   │
@@ -36,23 +36,41 @@
 - **Notifications** — `notify-send` at 80 % and 95 % of a window, once per window.
 - **Machine-readable** — `--short` (one line), `--json`, `--waybar` (Waybar custom module) and `--argos` (GNOME top bar via the Argos extension).
 - **Russian keyboard layout** — hotkeys work on ЙЦУКЕН too (`к` = `r`, `й` = `q`, …).
+- **Task manager** — processes grouped by app, search, sort, end with confirmation.
+- **16 views** — from the classic dashboard to gauges, a fuel tank, a live response feed and a weekly heatmap.
 
-## Views
-
-Switch views with `v` (saved to config) or `--view`:
-
-| View | What it shows |
-|---|---|
-| `dashboard` | agents + system; two columns on wide terminals, one on narrow |
-| `focus` | only limits, tokens and token speed |
-| `system` | only hardware: CPU, memory/temp/GPU, power, disk/network, processes |
-| `compact` | single column, total CPU only — good for small panes |
-| `minimal` | 5–6 lines: limits, tok/s, load, CPU, battery |
+## Quick start
 
 ```bash
-agentop --view focus
-agentop --list-views
+git clone https://github.com/avgustenko/agentop && cd agentop
+./install.sh     # agentop in ~/.local/bin, app menu entry, GNOME top bar extension
+agentop
 ```
+
+Log out and back in once (Wayland) to load the top bar indicator.
+
+## How to use
+
+1. Run `agentop`. 2. Press `v` / `V` to switch views (the choice is remembered). 3. Watch the 5h row: usage, reset time and the forecast at reset; you get a notification at 80% and 95%. 4. To end a frozen app: `d`, select it, `x`, `y` (SIGKILL is offered if it is still running after 3 s). 5. `s` opens settings.
+
+## View gallery
+
+Rendered from sample data with `python3 docs/make_screenshots.py`.
+
+| | |
+|---|---|
+| **Dashboard** · `dashboard`<br>![dashboard](docs/views/dashboard.png) | **Window timeline** · `timeline`<br>![timeline](docs/views/timeline.png) |
+| **Gauges** · `gauges`<br>![gauges](docs/views/gauges.png) | **Fuel tank** · `fuel`<br>![fuel](docs/views/fuel.png) |
+| **Brief** · `brief`<br>![brief](docs/views/brief.png) | **Response feed** · `feed`<br>![feed](docs/views/feed.png) |
+| **Week heatmap** · `week`<br>![week](docs/views/week.png) | **Tiles** · `tiles`<br>![tiles](docs/views/tiles.png) |
+| **Cockpit** · `cockpit`<br>![cockpit](docs/views/cockpit.png) | **Task manager** · `tasks`<br>![tasks](docs/views/tasks.png) |
+| **Sidebar** · `sidebar`<br>![sidebar](docs/views/sidebar.png) | **Beacon** · `beacon`<br>![beacon](docs/views/beacon.png) |
+| **Focus** · `focus`<br>![focus](docs/views/focus.png) | **System** · `system`<br>![system](docs/views/system.png) |
+| **Compact** · `compact`<br>![compact](docs/views/compact.png) | **Minimal** · `minimal`<br>![minimal](docs/views/minimal.png) |
+
+## GNOME top bar
+
+`gnome-extension/agentop@avgustenko` (GNOME 45–50) shows the limit in the top bar; the menu has a 5h window chart with the forecast, the weekly window, today's cost and buttons to open AgentOp or the task manager. Nine indicator styles are selectable from the menu. It polls `agentop --json` every 30 s and does no networking itself.
 
 ## Settings
 
@@ -126,6 +144,26 @@ In the live view:
 | `p` | pause / resume (0 % CPU while paused) |
 | `q` | quit |
 
+## Task manager
+
+Press `d` (or `agentop --view tasks`) for a process list with current CPU, memory and owner, grouped by application by default (all browser processes are one row).
+
+| Key | Action |
+|---|---|
+| `↑` `↓` `PgUp` `PgDn` `Home` `End` | move |
+| `x` / `Del` | end the selected app (asks first) |
+| `y` / `K` / `n` | in the prompt: end / force / cancel |
+| `c` `m` `n` `i` | sort by CPU, memory, name, PID (again to reverse) |
+| `g` | toggle grouping |
+| `/` | filter by name or PID |
+| `d` / `Esc` | back |
+
+Ending works like a system monitor: SIGTERM first; if the app is still running after 3 seconds, AgentOp offers SIGKILL. AgentOp itself, init and kernel threads are blocked; the terminal running AgentOp, session-critical processes and other users' processes get a warning.
+
+## Views
+
+`v` / `V` cycle views; `agentop --list-views` lists them: `dashboard`, `focus`, `timeline`, `gauges`, `fuel`, `brief`, `feed`, `week`, `tiles`, `cockpit`, `sidebar` (auto on terminals narrower than 52 columns), `beacon`, `tasks`, `system`, `compact`, `minimal`.
+
 ## Configuration
 
 `~/.config/agentop/config.json` is created on first run. See [`config.example.json`](config.example.json):
@@ -151,6 +189,7 @@ In the live view:
 - `limit_decimals` — decimals for limit percentages (the API currently returns whole percents, so you'll see `.000`).
 - `show.*` — toggle sections.
 - `notify`, `notify_thresholds` — limit notifications (thresholds in %).
+- `panel_style` — top bar indicator for `--argos`: `text`, `forecast`, `dot`, `cells`, `countdown`, `pulse`, `rotate`, `ring` (PNG ring), `bars` (PNG bars). One-off: `--panel-style ring`.
 - `prices` — override built-in prices: `{"claude-opus-5-5": [input, output, cache write 5m, cache read]}`, USD per 1M tokens.
 
 ### GNOME top bar (Argos)
@@ -193,7 +232,7 @@ exec ~/.local/bin/agentop --argos
 python3 -m unittest discover -s tests -v
 ```
 
-43 tests: formatting, ANSI/clip/pad, theme bars, sparklines, Braille graphs, settings, all views, key input (UTF-8, Russian layout, EOF), pricing, the limits log and trend, notifications, Waybar/Argos output and CLI smoke tests. Tests run with a temporary `HOME`, so they never read your logs or call the API with your token. CI runs them on every push.
+56 tests, including the task manager (ending a real process, SIGTERM → SIGKILL fallback, self-protection), every view at several terminal sizes and panel styles. Earlier: formatting, ANSI/clip/pad, theme bars, sparklines, Braille graphs, settings, all views, key input (UTF-8, Russian layout, EOF), pricing, the limits log and trend, notifications, Waybar/Argos output and CLI smoke tests. Tests run with a temporary `HOME`, so they never read your logs or call the API with your token. CI runs them on every push.
 
 ## License
 

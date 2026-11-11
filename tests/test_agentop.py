@@ -523,3 +523,226 @@ class FeatureTests(unittest.TestCase):
         a = mod.argos_out(app, data).splitlines()
         self.assertIn("5h 90%", a[0])
         self.assertIn("---", a)
+
+
+class TaskManagerTests(unittest.TestCase):
+    """Диспетчер задач 1.4.0."""
+
+    def key(self, raw, translate=True):
+        r, w = os.pipe()
+        try:
+            os.write(w, raw)
+            os.close(w)
+            w = None
+            return mod.read_key(r, translate)
+        finally:
+            os.close(r)
+            if w is not None:
+                os.close(w)
+
+    def test_special_keys(self):
+        self.assertEqual(self.key(b"\x1b[3~"), "DEL")
+        self.assertEqual(self.key(b"\x1b[5~"), "PGUP")
+        self.assertEqual(self.key(b"\x1b[6~"), "PGDN")
+        self.assertEqual(self.key(b"\x1b[H"), "HOME")
+        self.assertEqual(self.key(b"\x1bOF"), "END")
+        self.assertEqual(self.key("в".encode()), "d")
+        self.assertEqual(self.key("ч".encode()), "x")
+        self.assertEqual(self.key("в".encode(), translate=False), "в")
+
+    def test_snapshot(self):
+        pr = mod.Procs()
+        __import__("time").sleep(1.05)
+        snap = pr.snapshot()
+        me = [p for p in snap if p["pid"] == os.getpid()]
+        self.assertEqual(len(me), 1)
+        for k in ("pid", "name", "app", "cpu", "mem", "rss", "threads", "uid", "user", "ppid"):
+            self.assertIn(k, me[0])
+        self.assertIs(pr.snapshot(), snap)  # чаще раза в секунду — из кэша
+        self.assertTrue(pr.top(3))
+
+    def test_risks(self):
+        me = {"pid": os.getpid(), "name": "python", "uid": os.getuid(), "ppid": os.getppid()}
+        self.assertEqual(mod.proc_risk(me)[0], "block")
+        self.assertEqual(mod.proc_risk({"pid": 1, "name": "systemd", "uid": 0, "ppid": 0})[0], "block")
+        parent = {"pid": os.getppid(), "name": "bash", "uid": os.getuid(), "ppid": 1}
+        self.assertEqual(mod.proc_risk(parent)[0], "warn")
+        shell = {"pid": 999999, "name": "gnome-shell", "uid": os.getuid(), "ppid": 1}
+        self.assertEqual(mod.proc_risk(shell)[0], "warn")
+        other = {"pid": 999998, "name": "x", "uid": os.getuid() + 1, "user": "root", "ppid": 1}
+        self.assertIn("root", mod.proc_risk(other)[1])
+        normal = {"pid": 999997, "name": "sleep", "uid": os.getuid(), "ppid": 1}
+        self.assertIsNone(mod.proc_risk(normal))
+
+    def test_rows_group_sort_filter(self):
+        st = mod.TaskState()
+        procs = [
+            {"pid": 10, "name": "Web Content", "app": "firefox", "cpu": 5.0, "mem": 1, "rss": 100, "threads": 3, "uid": 1, "user": "u", "ppid": 1},
+            {"pid": 11, "name": "firefox", "app": "firefox", "cpu": 7.0, "mem": 2, "rss": 200, "threads": 9, "uid": 1, "user": "u", "ppid": 1},
+            {"pid": 12, "name": "vim", "app": "vim", "cpu": 9.0, "mem": 1, "rss": 50, "threads": 1, "uid": 1, "user": "u", "ppid": 1},
+        ]
+        rows = mod.task_rows(procs, st)
+        self.assertEqual([r["name"] for r in rows], ["firefox", "vim"])
+        self.assertEqual(sorted(rows[0]["pids"]), [10, 11])
+        self.assertAlmostEqual(rows[0]["cpu"], 12.0)
+        st.group = False
+        self.assertEqual([r["pid"] for r in mod.task_rows(procs, st)], [12, 11, 10])
+        st.filter = "vim"
+        self.assertEqual([r["pid"] for r in mod.task_rows(procs, st)], [12])
+
+    def test_kill_flow(self):
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        try:
+            app = make_app()
+            st = app.tasks
+            st.rows = [{"pid": child.pid, "pids": [child.pid], "name": "sleeper", "app": "sleeper",
+                        "uid": os.getuid(), "user": "me", "ppid": os.getpid()}]
+            self.assertTrue(mod.tasks_key(app, "x"))
+            self.assertIsNotNone(st.confirm)
+            self.assertTrue(mod.tasks_key(app, "n"))  # отмена
+            self.assertIsNone(st.confirm)
+            self.assertIsNone(child.poll())
+            mod.tasks_key(app, "x")
+            mod.tasks_key(app, "y")  # SIGTERM
+            child.wait(timeout=5)
+            self.assertEqual(child.returncode, -15)
+            st.pending["deadline"] = 0
+            mod.task_check_pending(st)
+            self.assertIn("завершён", st.message[0])
+        finally:
+            if child.poll() is None:
+                child.kill()
+
+    def test_force_kill_offer(self):
+        # процесс игнорирует SIGTERM → через 3 с предлагается принудительное завершение
+        child = subprocess.Popen([sys.executable, "-c",
+                                  "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); print('ok', flush=True); time.sleep(60)"],
+                                 stdout=subprocess.PIPE)
+        try:
+            child.stdout.readline()
+            app = make_app()
+            st = app.tasks
+            st.rows = [{"pid": child.pid, "pids": [child.pid], "name": "stubborn", "app": "stubborn",
+                        "uid": os.getuid(), "user": "me", "ppid": os.getpid()}]
+            mod.tasks_key(app, "x")
+            mod.tasks_key(app, "y")
+            st.pending["deadline"] = 0
+            mod.task_check_pending(st)
+            self.assertTrue(st.confirm and st.confirm["force"])
+            mod.tasks_key(app, "y")  # SIGKILL
+            child.wait(timeout=5)
+            self.assertEqual(child.returncode, -9)
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.stdout.close()
+
+    def test_block_self(self):
+        app = make_app()
+        st = app.tasks
+        st.rows = [{"pid": os.getpid(), "pids": [os.getpid()], "name": "me", "app": "me",
+                    "uid": os.getuid(), "user": "me", "ppid": os.getppid()}]
+        mod.tasks_key(app, "x")
+        self.assertIsNone(st.confirm)
+        self.assertIn("AgentOp", st.message[0])
+
+    def test_navigation_and_filter_typing(self):
+        app = make_app()
+        st = app.tasks
+        st.rows = [{"pid": i, "pids": [i], "name": f"p{i}"} for i in range(30)]
+        mod.tasks_key(app, "DOWN")
+        mod.tasks_key(app, "j")
+        self.assertEqual(st.sel, 2)
+        mod.tasks_key(app, "END")
+        self.assertEqual(st.sel, 29)
+        mod.tasks_key(app, "HOME")
+        self.assertEqual(st.sel, 0)
+        mod.tasks_key(app, "/")
+        for ch in "фай":
+            mod.tasks_key(app, ch)
+        self.assertEqual(st.filter, "фай")
+        mod.tasks_key(app, "\x7f")
+        self.assertEqual(st.filter, "фа")
+        mod.tasks_key(app, "ENTER")
+        self.assertFalse(st.typing)
+        mod.tasks_key(app, "m")
+        self.assertEqual(st.sort, "mem")
+        app.view = "tasks"
+        st.back_view = "gauges"
+        mod.tasks_key(app, "ESC")  # сначала сбрасывает поиск
+        self.assertEqual(st.filter, "")
+        mod.tasks_key(app, "ESC")  # потом возвращает к прошлому виду
+        self.assertEqual(app.view, "gauges")
+
+
+class ViewsTests(unittest.TestCase):
+    def test_all_views_all_sizes(self):
+        app = make_app()
+        data = app.sample()
+        data["tasks"] = app.procs.snapshot()
+        now = __import__("time").time()
+        iso = lambda ts: mod.datetime.fromtimestamp(ts).astimezone().isoformat()
+        data["limits"] = {"five_hour": {"utilization": 63, "resets_at": iso(now + 7200)},
+                          "seven_day": {"utilization": 12, "resets_at": iso(now + 3 * 86400)}}
+        data["limits_hist"] = {"5h": [(now - 3000, 30.0), (now - 1500, 45.0), (now - 300, 60.0)], "7d": []}
+        app.cache["week"] = {"ts": now, "start": now - 6 * 86400,
+                             "grid": [[(d * 24 + h) % 7 * 100 for h in range(24)] for d in range(7)]}
+        for view in mod.VIEWS:
+            app.view = view
+            for W, H in ((120, 40), (80, 24), (52, 18), (30, 12)):
+                lines = mod.render(app, data, W, H)
+                self.assertLessEqual(len(lines), H, (view, W, H))
+                for ln in lines:
+                    self.assertLessEqual(mod.vlen(ln), W, (view, W, H, ln))
+
+    def test_narrow_falls_back_to_sidebar(self):
+        app = make_app("gauges")
+        data = app.sample()
+        text = "\n".join(mod.render(app, data, 34, 30))
+        self.assertIn("ЛИМИТЫ", text)
+
+    def test_brief_sentences(self):
+        app = make_app()
+        data = app.sample()
+        now = __import__("time").time()
+        iso = lambda ts: mod.datetime.fromtimestamp(ts).astimezone().isoformat()
+        data["limits"] = {"five_hour": {"utilization": 60, "resets_at": iso(now + 3600)},
+                          "seven_day": {"utilization": 5, "resets_at": iso(now + 86400)}}
+        data["limits_hist"] = {"5h": [(now - 1500, 20.0)]}
+        text = "\n".join(mod.brief_lines(data, mod.Theme("mono")))
+        self.assertIn("Окно 5 часов заполнено на 60%", text)
+        self.assertIn("Лимит закончится", text)
+
+    def test_panel_styles_and_png(self):
+        app = make_app()
+        data = app.sample()
+        now = __import__("time").time()
+        iso = lambda ts: mod.datetime.fromtimestamp(ts).astimezone().isoformat()
+        data["limits"] = {"five_hour": {"utilization": 85, "resets_at": iso(now + 3600)},
+                          "seven_day": {"utilization": 5, "resets_at": iso(now + 86400)}}
+        for style in mod.PANEL_STYLES:
+            out = mod.argos_out(app, data, style)
+            first = out.splitlines()[0]
+            self.assertIn("useMarkup=true", first, style)
+            if style in ("ring", "bars"):
+                self.assertIn("image=", first)
+        self.assertTrue(mod.ring_png(50).startswith(b"\x89PNG"))
+        self.assertTrue(mod.bars_png(10, 90).startswith(b"\x89PNG"))
+        self.assertIn("&lt;", mod._pango("<b>"))
+
+    def test_feed_from_tail(self):
+        proj = Path(TMP_HOME, ".claude/projects/f")
+        proj.mkdir(parents=True, exist_ok=True)
+        now = mod.datetime.now().astimezone().isoformat()
+        (proj / "s.jsonl").write_text(json.dumps({
+            "type": "assistant", "timestamp": now, "requestId": "r1",
+            "message": {"id": "m1", "model": "claude-opus-5-5",
+                        "usage": {"input_tokens": 10, "output_tokens": 1000}}}) + "\n")
+        try:
+            tail = mod.ClaudeTail(1800)
+            tail.poll(force=True)
+        finally:
+            shutil.rmtree(Path(TMP_HOME, ".claude"))
+        self.assertEqual(len(tail.feed), 1)
+        self.assertEqual(tail.feed[0]["out"], 1000)
+        self.assertAlmostEqual(tail.feed[0]["cost"], (10 * 4 + 1000 * 20) / 1e6)
