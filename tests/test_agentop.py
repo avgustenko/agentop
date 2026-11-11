@@ -6,10 +6,19 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import atexit
+import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+
+# Изоляция: тесты не читают настоящие логи/токен и не трогают ~/.cache и ~/.config,
+# а CLI-запуски не ходят в API Anthropic с вашим токеном.
+TMP_HOME = tempfile.mkdtemp(prefix="agentop-test-")
+os.environ["HOME"] = TMP_HOME
+atexit.register(shutil.rmtree, TMP_HOME, True)
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "agentop"
@@ -387,3 +396,130 @@ class ReviewFixTests(unittest.TestCase):
             r = subprocess.run([sys.executable, str(SCRIPT), *args],
                                capture_output=True, text=True, env=env, timeout=30)
             self.assertEqual(r.returncode, 2, args)
+
+
+class FeatureTests(unittest.TestCase):
+    """Доработки 1.3.0."""
+
+    def setUp(self):
+        for f in (mod.HISTORY_FILE, mod.NOTIFY_STATE, mod.CLAUDE_CACHE):
+            try:
+                f.unlink()
+            except FileNotFoundError:
+                pass
+        mod._hist_cache.update(stamp=None, rows=[])
+
+    def test_isolated_home(self):
+        self.assertTrue(str(mod.HOME).startswith(TMP_HOME))
+
+    def test_model_price(self):
+        self.assertEqual(mod.model_price("claude-opus-5-5"), (4.0, 20.0, 5.0, 0.20))
+        self.assertEqual(mod.model_price("claude-opus-5")[0], 5.0)
+        self.assertEqual(mod.model_price("claude-sonnet-4-5-20250929")[0], 3.0)
+        self.assertIsNone(mod.model_price("gpt-x"))
+        self.assertEqual(mod.model_price("claude-opus-5-5", {"claude-opus-5-5": [1, 2, 3, 4]}),
+                         (1.0, 2.0, 3.0, 4.0))
+
+    def test_usage_cost(self):
+        u = {"input_tokens": 1_000_000, "output_tokens": 1_000_000,
+             "cache_creation_input_tokens": 2_000_000,
+             "cache_creation": {"ephemeral_1h_input_tokens": 1_000_000},
+             "cache_read_input_tokens": 10_000_000}
+        # 4 + 20 + 5 (5м) + 8 (1ч = 2×4) + 2 (чтение)
+        self.assertAlmostEqual(mod.usage_cost("claude-opus-5-5", u), 39.0)
+        u["speed"] = "fast"
+        self.assertAlmostEqual(mod.usage_cost("claude-opus-5-5", u), 78.0)
+        self.assertIsNone(mod.usage_cost("unknown", u))
+
+    def test_claude_today_models(self):
+        proj = Path(TMP_HOME, ".claude/projects/p")
+        proj.mkdir(parents=True, exist_ok=True)
+        now = mod.datetime.now().astimezone().isoformat()
+        line = lambda i, model: json.dumps({
+            "type": "assistant", "timestamp": now, "requestId": f"r{i}",
+            "message": {"id": f"m{i}", "model": model,
+                        "usage": {"input_tokens": 1000, "output_tokens": 2000}}})
+        (proj / "s.jsonl").write_text("\n".join([
+            line(1, "claude-opus-5-5"), line(1, "claude-opus-5-5"),  # дубль
+            line(2, "claude-sonnet-5-5"), line(3, "<synthetic>")]) + "\n")
+        try:
+            res = mod.claude_today(ttl=0)
+        finally:
+            shutil.rmtree(Path(TMP_HOME, ".claude"))
+        self.assertEqual(res["totals"]["messages"], 2)
+        self.assertEqual(set(res["models"]), {"claude-opus-5-5", "claude-sonnet-5-5"})
+        self.assertAlmostEqual(res["models"]["claude-opus-5-5"]["cost_api"], 0.044)
+        self.assertAlmostEqual(res["totals"]["cost_api"], 0.044 + 0.022)
+
+    def lim(self, u5, reset5):
+        iso = lambda ts: mod.datetime.fromtimestamp(ts).astimezone().isoformat()
+        return {"five_hour": {"utilization": u5, "resets_at": iso(reset5)},
+                "seven_day": {"utilization": 1, "resets_at": iso(reset5 + 86400)}}
+
+    def test_history_and_trend(self):
+        t0 = 1_800_000_000.0
+        reset = t0 + 3 * 3600
+        self.assertTrue(mod.record_limits(self.lim(10, reset), now=t0))
+        self.assertFalse(mod.record_limits(self.lim(10, reset), now=t0 + 60))  # без изменений
+        self.assertTrue(mod.record_limits(self.lim(20, reset), now=t0 + 1200))
+        pts = mod.window_history(self.lim(20, reset), "5h", "five_hour")
+        self.assertEqual([u for _, u in pts], [10.0, 20.0])
+        rate = mod.recent_rate(pts)
+        self.assertAlmostEqual(rate * 1200, 10.0)
+        # другое окно (другой сброс) — пусто
+        self.assertEqual(mod.window_history(self.lim(20, reset + 3600), "5h", "five_hour"), [])
+        self.assertIsNone(mod.recent_rate(pts[:1]))
+
+    def test_history_prunes_old(self):
+        t0 = 1_800_000_000.0
+        mod.record_limits(self.lim(10, t0 + 100), now=t0)
+        mod.record_limits(self.lim(50, t0 + 100), now=t0 + 9 * 86400)
+        self.assertEqual(len(mod.load_history()), 1)
+
+    def test_notify_once_per_window(self):
+        sent = []
+        sender = lambda title, body, urg: sent.append((title, urg))
+        now = __import__("time").time()
+        cfg = {"notify": True, "notify_thresholds": [80, 95]}
+        self.assertEqual(mod.maybe_notify(self.lim(50, now + 3600), cfg, now, sender), [])
+        mod.maybe_notify(self.lim(85, now + 3600), cfg, now, sender)
+        mod.maybe_notify(self.lim(86, now + 3600), cfg, now, sender)  # повтор — тихо
+        mod.maybe_notify(self.lim(97, now + 3600), cfg, now, sender)
+        self.assertEqual([u for _, u in sent], ["normal", "critical"])
+        mod.maybe_notify(self.lim(97, now + 3600), {"notify": False}, now, sender)
+        self.assertEqual(len(sent), 2)
+
+    def test_models_lines(self):
+        t = mod.Theme("mono")
+        cl = {"totals": {"cost_api": 1.5},
+              "models": {"claude-opus-5-5": {"output": 5000, "cache_read": 1, "messages": 3,
+                                             "cost_api": 1.5}}}
+        oc = {"models": {"deepseek-flash": {"cost": 0.25, "output": 10, "reasoning": 5,
+                                            "cache_read": 0, "messages": 1}}}
+        text = "\n".join(mod.models_lines(cl, oc, t, 80))
+        self.assertIn("opus-5-5", text)
+        self.assertIn("≈$1.50", text)
+        self.assertIn("$0.250", text)
+        self.assertIn("1.50", mod.models_title(cl))
+        self.assertIn("нет данных", mod.models_lines(None, None, t, 80)[0])
+
+    def test_limits_trend_line(self):
+        t = mod.Theme("mono")
+        now = __import__("time").time()
+        lim = self.lim(40, now + 3600)
+        hist = {"5h": [(now - 1500, 10.0), (now - 300, 35.0)]}  # 72%/ч → 112% к сбросу
+        text = "\n".join(mod.limits_lines(lim, t, 100, 0, hist))
+        self.assertIn("тренд 30м", text)
+        self.assertIn("хватит на", text)
+
+    def test_bar_outputs(self):
+        app = make_app()
+        data = app.sample()
+        now = __import__("time").time()
+        data["limits"] = self.lim(90, now + 3600)
+        w = json.loads(mod.waybar_out(app, data))
+        self.assertEqual(w["class"], "warning")
+        self.assertIn("5h 90%", w["text"])
+        a = mod.argos_out(app, data).splitlines()
+        self.assertIn("5h 90%", a[0])
+        self.assertIn("---", a)

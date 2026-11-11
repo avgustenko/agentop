@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-agentop 1.2.2 — терминальный дашборд агентов и железа.
+agentop 1.3.0 — терминальный дашборд агентов и железа.
 
   agentop                 живой виджет
   agentop --once          один кадр
   agentop --short         одна строка (статус-бар/промпт)
   agentop --json          машинный формат
+  agentop --waybar        JSON для Waybar · --argos — для GNOME-расширения Argos
   agentop --refresh       сбросить кэш и обновить данные
   agentop --theme nord    тема на один запуск
   agentop --set-theme nord  сохранить тему в конфиг
@@ -44,7 +45,7 @@ try:
 except ImportError:
     termios = tty = None
 
-VERSION = "1.2.2"
+VERSION = "1.3.0"
 VIEWS = ("dashboard", "focus", "system", "compact", "minimal")
 COLOR = (sys.stdout.isatty() and "NO_COLOR" not in os.environ
          and os.environ.get("TERM") != "dumb")
@@ -84,6 +85,70 @@ TTL_IO = 5.0
 TTL_PROCS = 30.0
 TTL_SPEED = 15.0
 
+# ─────────────────────── цены API Claude, $ за 1M токенов ───────────────────────
+# (ввод, вывод, запись кэша 5 мин, чтение кэша); запись 1 ч = 2× ввода.
+# Цены первого лица Anthropic на 2026-11; переопределяются в конфиге: "prices".
+PRICES = {
+    "claude-fable-5-2":  (8.0, 40.0, 10.0, 0.20),
+    "claude-mythos-5-2": (8.0, 40.0, 10.0, 0.20),
+    "claude-fable-5-1":  (10.0, 50.0, 12.5, 0.25),
+    "claude-mythos-5-1": (10.0, 50.0, 12.5, 0.25),
+    "claude-fable-5":    (10.0, 50.0, 12.5, 1.00),
+    "claude-mythos-5":   (10.0, 50.0, 12.5, 1.00),
+    "claude-opus-5-5":   (4.0, 20.0, 5.0, 0.20),
+    "claude-opus-5":     (5.0, 25.0, 6.25, 0.50),
+    "claude-opus-4":     (5.0, 25.0, 6.25, 0.50),
+    "claude-sonnet-5-5": (2.0, 10.0, 2.5, 0.10),
+    "claude-sonnet-5":   (2.0, 10.0, 2.5, 0.20),
+    "claude-sonnet-4":   (3.0, 15.0, 3.75, 0.30),
+    "claude-haiku-5-5":  (0.10, 0.50, 0.125, 0.01),
+    "claude-haiku-4":    (1.0, 5.0, 1.25, 0.10),
+}
+
+
+def model_price(model, overrides=None):
+    """Цена по самому длинному совпадающему префиксу id модели (даты в id не мешают)."""
+    table = dict(PRICES)
+    if isinstance(overrides, dict):
+        for k, v in overrides.items():
+            if isinstance(v, (list, tuple)) and len(v) == 4:
+                try:
+                    table[k] = tuple(float(x) for x in v)
+                except (TypeError, ValueError):
+                    pass
+    best = None
+    for k in table:
+        if model.startswith(k) and (best is None or len(k) > len(best)):
+            best = k
+    return table.get(best)
+
+
+def usage_cost(model, u, overrides=None):
+    """Стоимость одного ответа по ценам API, $; None — модель неизвестна."""
+    p = model_price(model or "", overrides)
+    if not p:
+        return None
+    pin, pout, pw5, pread = p
+    cc = u.get("cache_creation") or {}
+    w1h = int(cc.get("ephemeral_1h_input_tokens") or 0)
+    w_all = int(u.get("cache_creation_input_tokens") or 0)
+    w5 = max(0, w_all - w1h)
+    cost = (int(u.get("input_tokens") or 0) * pin
+            + int(u.get("output_tokens") or 0) * pout
+            + w5 * pw5 + w1h * pin * 2
+            + int(u.get("cache_read_input_tokens") or 0) * pread) / 1e6
+    if u.get("speed") == "fast":
+        cost *= 2
+    return cost
+
+
+def short_model(name, width=14):
+    n = re.sub(r"-\d{8}$", "", str(name or "?"))
+    if n.startswith("claude-") and len(n) > 7:
+        n = n[7:]
+    return n[:width]
+
+
 # ───────────────────────────── темы ─────────────────────────────
 THEMES = {
     "catppuccin-mocha": dict(accent=183, blue=111, green=151, yellow=223,
@@ -114,7 +179,10 @@ DEFAULT_CONFIG = {
     "history_interval": 2.0,
     "limit_decimals": 3,
     "clock_ms": False,
-    "show": {"network": True, "disk": True, "processes": True, "gpu": True, "per_core": True},
+    "notify": True,
+    "notify_thresholds": [80, 95],
+    "show": {"network": True, "disk": True, "processes": True, "gpu": True,
+             "per_core": True, "models": True},
 }
 
 
@@ -451,6 +519,7 @@ def claude_limits(ttl=TTL_LIMITS, force=False):
         tmp.write_text(json.dumps(data))
         os.chmod(tmp, 0o600)
         tmp.replace(USAGE_CACHE)
+        record_limits(data)
         return data
     except urllib.error.HTTPError as e:
         if e.code == 429:
@@ -482,12 +551,186 @@ def claude_limits(ttl=TTL_LIMITS, force=False):
     return {"error": err}
 
 
-def claude_today(ttl=TTL_CLAUDE):
+CLAUDE_CACHE_VERSION = 2
+
+
+# ───────────── журнал лимитов: тренд, история окна, уведомления ─────────────
+HISTORY_FILE = CACHE_DIR / "limits_history.jsonl"
+NOTIFY_STATE = CACHE_DIR / "notified.json"
+HISTORY_KEEP = 8 * 86400
+LIMIT_WINDOWS = (("5h", "five_hour", 5 * 3600), ("7d", "seven_day", 7 * 86400))
+_hist_cache = {"stamp": None, "rows": []}
+
+
+def _iso_ts(s):
+    try:
+        return datetime.fromisoformat(str(s).replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+def load_history():
+    """Строки журнала; перечитываются только если файл изменился."""
+    try:
+        st = HISTORY_FILE.stat()
+    except OSError:
+        return []
+    stamp = (st.st_mtime, st.st_size)
+    if _hist_cache["stamp"] != stamp:
+        rows = []
+        try:
+            with open(HISTORY_FILE, encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        r = json.loads(line)
+                    except Exception:
+                        continue
+                    if isinstance(r, dict) and "ts" in r:
+                        rows.append(r)
+        except OSError:
+            pass
+        _hist_cache.update(stamp=stamp, rows=rows)
+    return _hist_cache["rows"]
+
+
+def record_limits(data, now=None):
+    """Дописать точку: при изменении процентов или раз в 5 минут. Старше 8 дней — удаляется."""
+    now = now or time.time()
+    row = {"ts": round(now, 1)}
+    for label, key, _ in LIMIT_WINDOWS:
+        o = (data or {}).get(key) or {}
+        if o.get("utilization") is None:
+            continue
+        row[label] = float(o["utilization"])
+        row[label + "_reset"] = _iso_ts(o.get("resets_at"))
+    if len(row) == 1:
+        return False
+    rows = load_history()
+    if rows:
+        last = rows[-1]
+        same = all(last.get(k) == row.get(k) for k in ("5h", "7d"))
+        if same and now - float(last.get("ts", 0)) < 300:
+            return False
+    try:
+        keep = [r for r in rows if now - float(r.get("ts", 0)) < HISTORY_KEEP]
+        if len(keep) < len(rows):
+            tmp = HISTORY_FILE.with_suffix(".tmp")
+            tmp.write_text("".join(json.dumps(r) + "\n" for r in keep + [row]))
+            os.chmod(tmp, 0o600)
+            tmp.replace(HISTORY_FILE)
+        else:
+            with open(HISTORY_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(row) + "\n")
+            os.chmod(HISTORY_FILE, 0o600)
+        return True
+    except OSError:
+        return False
+
+
+def window_history(lim, label, key):
+    """Точки (ts, %) текущего окна лимита — по совпадению момента сброса (±2 мин)."""
+    o = (lim or {}).get(key) or {}
+    reset = _iso_ts(o.get("resets_at"))
+    if reset is None or o.get("utilization") is None:
+        return []
+    pts = []
+    for r in load_history():
+        rr = r.get(label + "_reset")
+        if label in r and rr is not None and abs(float(rr) - reset) < 120:
+            pts.append((float(r["ts"]), float(r[label])))
+    pts.sort()
+    return pts
+
+
+def recent_rate(pts, span=1800, min_span=600):
+    """Скорость роста, %/с, по точкам за последние span секунд; None — мало данных."""
+    if len(pts) < 2:
+        return None
+    end = pts[-1][0]
+    win = [p for p in pts if p[0] >= end - span]
+    if len(win) < 2 or win[-1][0] - win[0][0] < min_span:
+        return None
+    return max(0.0, (win[-1][1] - win[0][1]) / (win[-1][0] - win[0][0]))
+
+
+def resample(values, n):
+    vals = list(values)
+    if len(vals) <= n:
+        return vals
+    return [vals[int(i * (len(vals) - 1) / (n - 1))] for i in range(n)]
+
+
+def maybe_notify(lim, cfg, now=None, sender=None):
+    """Уведомление на рабочий стол при пересечении порогов — один раз за окно."""
+    if not _as_bool(cfg.get("notify"), True) or not lim or lim.get("error"):
+        return []
+    ths = []
+    for x in cfg.get("notify_thresholds") or []:
+        try:
+            if 0 < float(x) <= 100:
+                ths.append(float(x))
+        except (TypeError, ValueError):
+            pass
+    if not ths:
+        return []
+    if sender is None:
+        if not shutil.which("notify-send"):
+            return []
+        sender = _notify_send
+    now = now or time.time()
+    try:
+        state = json.loads(NOTIFY_STATE.read_text())
+        if not isinstance(state, dict):
+            state = {}
+    except Exception:
+        state = {}
+    sent = []
+    for label, key, _ in LIMIT_WINDOWS:
+        o = lim.get(key) or {}
+        used = o.get("utilization")
+        reset = _iso_ts(o.get("resets_at"))
+        if used is None or reset is None or reset <= now:
+            continue
+        crossed = [th for th in ths if float(used) >= th]
+        if not crossed:
+            continue
+        top = max(crossed)
+        rid = f"{key}|{int(reset // 60)}"
+        if f"{rid}|{top:g}" in state:
+            continue
+        for th in crossed:
+            state[f"{rid}|{th:g}"] = now
+        title = f"Claude: {label} лимит {float(used):.0f}%"
+        body = f"сброс через {human_left(reset - now)}"
+        sender(title, body, "critical" if top >= 95 else "normal")
+        sent.append(title)
+    if sent:
+        state = {k: v for k, v in state.items() if now - float(v) < HISTORY_KEEP}
+        try:
+            tmp = NOTIFY_STATE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(state))
+            tmp.replace(NOTIFY_STATE)
+        except OSError:
+            pass
+    return sent
+
+
+def _notify_send(title, body, urgency):
+    try:
+        subprocess.run(["notify-send", "-a", "AgentOp", "-u", urgency,
+                        "-i", "dialog-warning", title, body],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+    except Exception:
+        pass
+
+
+def claude_today(ttl=TTL_CLAUDE, prices=None):
     today = datetime.now().astimezone().date().isoformat()
     if CLAUDE_CACHE.exists():
         try:
             c = json.loads(CLAUDE_CACHE.read_text())
-            if c.get("date") == today and time.time() - c.get("ts", 0) < ttl:
+            if (c.get("date") == today and c.get("v") == CLAUDE_CACHE_VERSION
+                    and time.time() - c.get("ts", 0) < ttl):
                 return c
         except Exception:
             pass
@@ -495,7 +738,8 @@ def claude_today(ttl=TTL_CLAUDE):
     midnight = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
     start = midnight.timestamp()
     seen = set()
-    totals = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "messages": 0}
+    totals = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "messages": 0,
+              "cost_api": 0.0}
     models = {}
 
     for path in glob.glob(str(HOME / ".claude/projects/**/*.jsonl"), recursive=True):
@@ -535,18 +779,27 @@ def claude_today(ttl=TTL_CLAUDE):
                         "cache_read": int(u.get("cache_read_input_tokens") or 0),
                         "cache_write": int(u.get("cache_creation_input_tokens") or 0),
                     }
+                    m = msg.get("model") or "?"
+                    if m.startswith("<"):  # "<synthetic>" — служебные записи без вызова API
+                        continue
                     totals["messages"] += 1
                     for k, v in vals.items():
                         totals[k] += v
-                    m = msg.get("model") or "?"
-                    mm = models.setdefault(m, {"input": 0, "output": 0,
-                                               "cache_read": 0, "cache_write": 0})
+                    mm = models.setdefault(m, {"input": 0, "output": 0, "cache_read": 0,
+                                               "cache_write": 0, "messages": 0,
+                                               "cost_api": 0.0})
                     for k, v in vals.items():
                         mm[k] += v
+                    mm["messages"] += 1
+                    cost = usage_cost(m, u, prices)
+                    if cost is not None:
+                        mm["cost_api"] += cost
+                        totals["cost_api"] += cost
         except Exception:
             continue
 
-    res = {"date": today, "ts": time.time(), "totals": totals, "models": models}
+    res = {"v": CLAUDE_CACHE_VERSION, "date": today, "ts": time.time(),
+           "totals": totals, "models": models}
     try:
         tmp = CLAUDE_CACHE.with_suffix(".tmp")
         tmp.write_text(json.dumps(res))
@@ -1132,7 +1385,7 @@ def content_line(t, W, s):
     return t.c("dim", "│ ") + pad(clip(s, inner), inner) + t.c("dim", " │")
 
 
-def limits_lines(lim, t, W, decimals=3):
+def limits_lines(lim, t, W, decimals=3, hist=None):
     lines = []
     if not lim or lim.get("error"):
         return [f"  {t.c('red', '⚠')} {t.c('dim', (lim or {}).get('error', 'нет данных'))}"]
@@ -1175,13 +1428,29 @@ def limits_lines(lim, t, W, decimals=3):
         if show_pace and pace is not None and used < 99.5:
             pcol = "red" if pace >= 105 else "yellow" if pace >= 85 else "dim"
             line += f"  {t.c('dim', 'pace')} {t.c(pcol, f'{pace:.1f}%')}"
+        pts = list((hist or {}).get(label) or [])
+        rrate = recent_rate(pts + [(time.time(), used)]) if pts else None
         if used >= 99.5:
             warn.append(f"{label} лимит исчерпан" + (f", сброс через {human_left(rem)}" if rem and rem > 0 else ""))
-        elif pace and pace >= 105 and rem and rem > 0:
-            elapsed = wlen - rem
-            rate = used / max(1, elapsed)
-            warn.append(f"{label} хватит на {human_left((100 - used) / max(1e-9, rate))}")
+        elif rem and rem > 0:
+            # прогноз по свежему темпу (30 мин журнала), иначе — по среднему с начала окна
+            if rrate is not None:
+                if used + rrate * rem >= 100 and rrate > 0:
+                    warn.append(f"{label} хватит на {human_left((100 - used) / rrate)} (темп 30м)")
+            elif pace and pace >= 105 and wlen - rem >= wlen * 0.1:
+                # в первые 10% окна средний темп слишком шумный для прогноза
+                rate = used / max(1, wlen - rem)
+                warn.append(f"{label} хватит на {human_left((100 - used) / max(1e-9, rate))}")
         lines.append(line)
+        if W >= 56 and len(pts) >= 2:
+            vals = [u for _, u in pts] + [used]
+            extra = f"      {sparkline(resample(vals, 24), t, 'gradient')}"
+            if rrate is not None and rem and rem > 0:
+                proj = min(999.0, used + rrate * rem)
+                pcol = "red" if proj >= 100 else "yellow" if proj >= 85 else "dim"
+                extra += (f"  {t.c('dim', 'тренд 30м')} {rrate * 3600:.1f}%/ч"
+                          f"  {t.c('dim', 'к сбросу')} {t.c(pcol, f'{proj:.0f}%')}")
+            lines.append(extra)
     if warn:
         lines.append(f"  {t.c('red', '⚠')} {t.c('red', ' · '.join(warn))}")
     return lines
@@ -1235,6 +1504,39 @@ def tokens_lines(cl, oc, t, W):
     else:
         lines.append(f"  {t.c('blue', 'opencode')} {t.c('dim', 'нет данных')}")
     return lines
+
+
+def models_title(cl):
+    cost = float(((cl or {}).get("totals") or {}).get("cost_api") or 0)
+    return f"МОДЕЛИ · СЕГОДНЯ · Claude ≈${cost:.2f} по ценам API"
+
+
+def models_lines(cl, oc, t, W, limit=6):
+    rows = []
+    for name, m in ((cl or {}).get("models") or {}).items():
+        rows.append((float(m.get("cost_api") or 0), "Claude", name, m.get("output", 0),
+                     m.get("cache_read", 0), m.get("messages", 0), True))
+    for name, m in ((oc or {}).get("models") or {}).items():
+        rows.append((float(m.get("cost") or 0), "oc", name,
+                     int(m.get("output") or 0) + int(m.get("reasoning") or 0),
+                     m.get("cache_read", 0), m.get("messages", 0), False))
+    if not rows:
+        return [f"  {t.c('dim', 'нет данных за сегодня')}"]
+    rows.sort(key=lambda r: (r[0], r[3]), reverse=True)
+    nw = 14 if W >= 56 else 10
+    out = []
+    for cost, src, name, outt, cread, msgs, approx in rows[:limit]:
+        col = "accent" if src == "Claude" else "blue"
+        price = (t.c("dim", "≈") + t.c("yellow", f"${cost:.2f}")) if approx \
+            else t.c("green", f"${cost:.3f}")
+        line = (f"  {t.c(col, '●')} {t.c('text', pad(short_model(name, nw), nw))} "
+                f"{t.c('dim', 'out')} {fmt_tokens(outt):>6}")
+        if W >= 56:
+            line += f"  {t.c('dim', 'cache')} {fmt_tokens(cread):>6}"
+        if W >= 66 and msgs:
+            line += f"  {t.c('dim', f'{msgs} msg')}"
+        out.append(line + f"  {price}")
+    return out
 
 
 def speed_lines(speed, t, W, big=False):
@@ -1432,6 +1734,8 @@ class App:
                     self.cache["limits"] = data
                     self.ts["limits"] = time.time()
                 if ok:
+                    maybe_notify(data, self.cfg)
+                if ok:
                     delay = LIMITS_REFRESH
                 else:
                     delay = min(300, max(60, (delay or LIMITS_REFRESH) * 2))
@@ -1472,7 +1776,7 @@ class App:
         else:
             c["limits"] = self.cache.get("limits")
         if self._due("claude", TTL_CLAUDE):
-            c["claude"] = claude_today()
+            c["claude"] = claude_today(prices=self.cfg.get("prices"))
             self.ts["claude"] = now
             changed = True
         if self._due("oc", TTL_OC):
@@ -1528,6 +1832,8 @@ class App:
         return {
             "version": self.version,
             "limits": c.get("limits"),
+            "limits_hist": {label: window_history(c.get("limits"), label, key)
+                            for label, key, _ in LIMIT_WINDOWS},
             "claude": c.get("claude"),
             "opencode": c.get("oc"),
             "speed": self.speed,
@@ -1605,6 +1911,8 @@ def settings_items(cfg):
         ("history_interval", "Шаг истории", HISTORY_STEP_CHOICES),
         ("limit_decimals", "Знаков в лимитах", DECIMALS_CHOICES),
         ("clock_ms", "Сантисекунды", BOOL_CHOICES),
+        ("notify", "Уведомления", BOOL_CHOICES),
+        ("show.models", "Модели", BOOL_CHOICES),
         ("show.network", "Сеть", BOOL_CHOICES),
         ("show.disk", "Диск", BOOL_CHOICES),
         ("show.processes", "Процессы", BOOL_CHOICES),
@@ -1754,11 +2062,14 @@ def limits_title(data):
 
 def _agent_blocks(app, data, t, cw, decimals):
     return [
-        ("limits", limits_title(data), limits_lines(data["limits"], t, cw, decimals), False),
+        ("limits", limits_title(data),
+         limits_lines(data["limits"], t, cw, decimals, data.get("limits_hist")), False),
         ("tokens", "ТОКЕНЫ · СЕГОДНЯ",
          tokens_lines(data["claude"], data["opencode"], t, cw), False),
         ("speed", "СКОРОСТЬ ТОКЕНОВ · 15 МИН", None, False),
-    ]
+    ] + ([("models", models_title(data["claude"]),
+           models_lines(data["claude"], data["opencode"], t, cw), True)]
+         if _as_bool(_show_cfg(app.cfg).get("models"), True) else [])
 
 
 def _system_blocks(app, data, t, cw):
@@ -1913,9 +2224,14 @@ def _double_column(app, data, W, H, show_ms, paused):
 
     def build(per_core=True, optional=True):
         left = []
-        left += col(limits_title(data), limits_lines(data["limits"], t, lw, decimals), lw)
+        left += col(limits_title(data), limits_lines(data["limits"], t, lw, decimals,
+                                                     data.get("limits_hist")), lw)
         left += col("ТОКЕНЫ · СЕГОДНЯ", tokens_lines(data["claude"], data["opencode"], t, lw), lw)
         left += col("СКОРОСТЬ ТОКЕНОВ", speed_lines(data["speed"], t, lw, big=False), lw)
+        if optional and _as_bool(_show_cfg(app.cfg).get("models"), True):
+            cost = float(((data["claude"] or {}).get("totals") or {}).get("cost_api") or 0)
+            left += col(f"МОДЕЛИ · Claude ≈${cost:.2f} API",
+                        models_lines(data["claude"], data["opencode"], t, lw, limit=5), lw)
 
         right = []
         right += col("CPU", cpu_lines(data["pcts"], data["load"], data["hist_cpu"],
@@ -1987,6 +2303,55 @@ def short(app, data):
     return " · ".join(parts)
 
 
+def bar_summary(data):
+    """Общие данные для статус-баров: текст, подсказка, уровень."""
+    lim = data["limits"] or {}
+    parts, tips, worst = [], [], 0.0
+    if lim.get("error"):
+        parts.append("claude --")
+        tips.append(f"Claude: {lim['error']}")
+    for label, key, _ in LIMIT_WINDOWS:
+        o = lim.get(key) or {}
+        u = o.get("utilization")
+        if u is None or lim.get("error"):
+            continue
+        if window_expired(o):
+            parts.append(f"{label} reset")
+            tips.append(f"{label}: окно сброшено")
+            continue
+        worst = max(worst, float(u))
+        parts.append(f"{label} {float(u):.0f}%")
+        reset = _iso_ts(o.get("resets_at"))
+        tips.append(f"{label}: {float(u):.0f}%" +
+                    (f" · сброс через {human_left(reset - time.time())}" if reset else ""))
+    ctot = (data["claude"] or {}).get("totals") or {}
+    otot = (data["opencode"] or {}).get("today") or {}
+    tips.append(f"Claude сегодня: out {fmt_tokens(ctot.get('output', 0))}, "
+                f"≈${float(ctot.get('cost_api') or 0):.2f} по ценам API")
+    if otot:
+        tips.append(f"opencode сегодня: ${float(otot.get('cost') or 0):.3f}")
+    tips.append(f"скорость: {data['speed'].rate(60):.0f} tok/s")
+    level = "critical" if worst >= 95 else "warning" if worst >= 80 else "normal"
+    return " · ".join(parts) or "claude", tips, level, worst
+
+
+def waybar_out(app, data):
+    text, tips, level, worst = bar_summary(data)
+    return json.dumps({"text": text, "tooltip": "\n".join(tips), "class": level,
+                       "alt": level, "percentage": int(round(worst))}, ensure_ascii=False)
+
+
+def argos_out(app, data):
+    """Формат Argos/BitBar (расширение «Argos» для верхней панели GNOME)."""
+    text, tips, level, _ = bar_summary(data)
+    color = {"critical": "#f38ba8", "warning": "#f9e2af"}.get(level)
+    first = f"{text} | font=monospace" + (f" color={color}" if color else "")
+    term = shutil.which("ghostty") and "ghostty -e agentop" or "x-terminal-emulator -e agentop"
+    out = [first, "---"] + [f"{x.replace('|', '/')} | font=monospace" for x in tips]
+    out += ["---", f"Открыть AgentOp | bash='{term}' terminal=false"]
+    return "\n".join(out)
+
+
 def json_out(app, data):
     lim = data["limits"] or {}
     otot = (data["opencode"] or {}).get("today") or {}
@@ -1997,8 +2362,11 @@ def json_out(app, data):
         "theme": app.theme.name,
         "limits": {"five_hour": lim.get("five_hour"), "seven_day": lim.get("seven_day"),
                    "error": lim.get("error"), "stale": lim.get("_stale", False)},
-        "claude": {"totals": ctot, "date": (data["claude"] or {}).get("date")},
-        "opencode": {"today": otot, "all_cost": (data["opencode"] or {}).get("all_cost")},
+        "limits_history": {k: v for k, v in (data.get("limits_hist") or {}).items()},
+        "claude": {"totals": ctot, "date": (data["claude"] or {}).get("date"),
+                   "models": (data["claude"] or {}).get("models") or {}},
+        "opencode": {"today": otot, "all_cost": (data["opencode"] or {}).get("all_cost"),
+                     "models": (data["opencode"] or {}).get("models") or {}},
         "speed": {"now": data["speed"].rate(30), "avg5m": data["speed"].rate(300),
                   "peak": data["speed"].peak(60, 900)},
         "system": {"load": list(data["load"]), "cpu": total,
@@ -2018,6 +2386,8 @@ def main():
     ap.add_argument("--once", action="store_true", help="вывести один раз")
     ap.add_argument("--short", action="store_true", help="одна строка")
     ap.add_argument("--json", action="store_true", help="JSON")
+    ap.add_argument("--waybar", action="store_true", help="JSON для модуля custom в Waybar")
+    ap.add_argument("--argos", action="store_true", help="вывод для GNOME-расширения Argos")
     ap.add_argument("--refresh", "-r", action="store_true", help="сбросить кэш")
     ap.add_argument("--theme", help="тема на один запуск")
     ap.add_argument("--set-theme", help="сохранить тему в конфиг")
@@ -2075,7 +2445,7 @@ def main():
     if args.refresh:
         clear_cache()
 
-    one_shot = (args.once or args.short or args.json
+    one_shot = (args.once or args.short or args.json or args.waybar or args.argos
                 or not (sys.stdout.isatty() and sys.stdin.isatty()))
 
     app = App(cfg, threaded=not one_shot)
@@ -2098,6 +2468,10 @@ def main():
         data = app.sample()
         if args.json:
             print(json_out(app, data))
+        elif args.waybar:
+            print(waybar_out(app, data))
+        elif args.argos:
+            print(argos_out(app, data))
         elif args.short:
             print(short(app, data))
         else:
