@@ -128,6 +128,137 @@ def demo_data(app):
     return data
 
 
+# ───────── виджет верхней панели: изображения по коду расширения ─────────
+SANS = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+SANS_B = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+HEX = {"good": (166, 227, 161), "warn": (249, 226, 175), "crit": (243, 139, 168), "dim": (141, 141, 160),
+       "accent": (203, 166, 247), "text": (241, 241, 244)}
+SC = 2  # рисуем в 2× и уменьшаем — сглаживание
+
+
+def _f(path, size):
+    return ImageFont.truetype(path, size * SC)
+
+
+def _ring(d, x, y, size, pct, col):
+    r = size * SC
+    w = max(2, int(r * 0.19))
+    d.ellipse([x, y, x + r, y + r], outline=(72, 72, 78), width=w)
+    d.arc([x, y, x + r, y + r], -90, -90 + 360 * pct / 100, fill=col, width=w)
+
+
+def _bars(d, x, y, a, b):
+    for i, p in enumerate((a, b)):
+        bx = x + i * 8 * SC
+        d.rectangle([bx, y, bx + 6 * SC, y + 16 * SC], fill=(72, 72, 78))
+        h = 16 * SC * p / 100
+        col = HEX["warn"] if p >= 80 else HEX["accent"]
+        d.rectangle([bx, y + 16 * SC - h, bx + 6 * SC, y + 16 * SC], fill=col)
+
+
+def _parts(style, u5=64, u7=23, proj=88, rem="2:35", tok=192):
+    lv = "crit" if u5 >= 95 else "warn" if u5 >= 80 else "good"
+    return {
+        "text": [(f"5h {u5}% · 7d {u7}%", None)],
+        "forecast": [("5h ", None), ("→ ", "dim"), (f"{proj}%", "crit" if proj >= 100 else "warn" if proj >= 85 else "good")],
+        "dot": [("●", "good")] if u5 < 80 else [(f"● 5h {u5}%", lv)],
+        "cells": [("▮" * round((100 - u5) / 10), lv), ("▯" * (10 - round((100 - u5) / 10)), "dim")],
+        "countdown": [("● ", lv), (f"↻ {rem}", None)],
+        "pulse": [("▂▃▅▇▅▃", "dim"), (f" {tok} t/s", None)],
+        "rotate": [(f"5h {u5}%", None)],
+        "ring": [(f"{u5}%", None)],
+        "bars": [],
+    }[style]
+
+
+def widget_styles(path):
+    names = [("text", "Текст"), ("forecast", "Прогноз"), ("dot", "Только точка"), ("cells", "Ячейки батареи"),
+             ("countdown", "Обратный отсчёт"), ("pulse", "Пульс"), ("rotate", "Карусель"), ("ring", "Кольцо"), ("bars", "Два столбика")]
+    W, rowh = 780, 46
+    img = Image.new("RGB", (W * SC, (len(names) * rowh + 16) * SC), (24, 24, 30))
+    d = ImageDraw.Draw(img)
+    mono, sans = _f(FONT, 14), _f(SANS, 14)
+    for i, (style, title) in enumerate(names):
+        y0 = (8 + i * rowh) * SC
+        d.rounded_rectangle([12 * SC, y0, 460 * SC, y0 + 34 * SC], radius=8 * SC, fill=(0, 0, 0))
+        d.text((24 * SC, y0 + 8 * SC), "Обзор", font=sans, fill=HEX["text"])
+        d.text((180 * SC, y0 + 8 * SC), "19:42", font=sans, fill=HEX["text"])
+        parts = _parts(style)
+        tw = sum(d.textlength(t, font=mono) for t, _ in parts) + (22 * SC if style in ("ring", "bars") else 0)
+        px = 400 * SC - tw
+        d.rounded_rectangle([px - 10 * SC, y0 + 5 * SC, 410 * SC, y0 + 29 * SC], radius=12 * SC, fill=(40, 40, 46))
+        if style == "ring":
+            _ring(d, px, y0 + 9 * SC, 16, 64, HEX["accent"])
+            px += 22 * SC
+        if style == "bars":
+            _bars(d, px + 4 * SC, y0 + 9 * SC, 64, 23)
+        for t, c in parts:
+            d.text((px, y0 + 8 * SC), t, font=mono, fill=HEX[c] if c else HEX["text"])
+            px += d.textlength(t, font=mono)
+        d.text((424 * SC, y0 + 6 * SC), "▾ 82%", font=sans, fill=(200, 200, 210))
+        d.text((490 * SC, y0 + 8 * SC), f"{title}  ·  {style}", font=sans, fill=(200, 200, 210))
+    img.resize((W, img.height // SC), Image.LANCZOS).save(path, optimize=True)
+
+
+def widget_menu(path):
+    W, H = 420, 470
+    img = Image.new("RGB", (W * SC, H * SC), (46, 44, 68))
+    d = ImageDraw.Draw(img)
+    sans, sb = _f(SANS, 14), _f(SANS_B, 30)
+    small, mono = _f(SANS, 12), _f(FONT, 14)
+    # панель
+    d.rectangle([0, 0, W * SC, 32 * SC], fill=(0, 0, 0))
+    d.text((W * SC - 200 * SC, 8 * SC), "5h ", font=mono, fill=HEX["text"])
+    d.text((W * SC - 200 * SC + d.textlength("5h ", font=mono), 8 * SC), "→ 88%", font=mono, fill=HEX["warn"])
+    d.text((W * SC - 70 * SC, 7 * SC), "▾ 82%", font=sans, fill=(200, 200, 210))
+    # меню
+    x0, y0, x1, y1 = 14 * SC, 40 * SC, (W - 14) * SC, (H - 8) * SC
+    d.rounded_rectangle([x0, y0, x1, y1], radius=16 * SC, fill=(38, 38, 47))
+    L = x0 + 18 * SC
+    R = x1 - 18 * SC
+    y = y0 + 16 * SC
+    d.text((L, y), "Окно 5 часов", font=small, fill=(169, 169, 184))
+    d.text((R - d.textlength("сброс через", font=small), y), "сброс через", font=small, fill=(169, 169, 184))
+    d.text((L, y + 18 * SC), "64%", font=sb, fill=HEX["text"])
+    t = "2ч 35м"
+    d.text((R - d.textlength(t, font=_f(SANS_B, 20)), y + 24 * SC), t, font=_f(SANS_B, 20), fill=HEX["text"])
+    # график окна
+    cy0, cy1 = y + 68 * SC, y + 158 * SC
+    cw = R - L
+    ys = lambda v: cy1 - (cy1 - cy0) * v / 100
+    d.line([L, ys(80), R, ys(80)], fill=(70, 70, 80), width=SC)
+    d.text((R - 26 * SC, ys(80) - 15 * SC), "80%", font=small, fill=(141, 141, 160))
+    frac_now = 0.48
+    pts = [(L + cw * frac_now * i / 27, ys(64 * (i / 27) ** 1.25)) for i in range(28)]
+    d.polygon(pts + [(pts[-1][0], cy1), (L, cy1)], fill=(83, 73, 104))
+    d.line(pts, fill=HEX["accent"], width=2 * SC)
+    nx, ny = pts[-1]
+    for k in range(0, 40):
+        if k % 2 == 0:
+            a, b = k / 40, (k + 1) / 40
+            d.line([nx + (R - nx) * a, ny + (ys(88) - ny) * a, nx + (R - nx) * b, ny + (ys(88) - ny) * b], fill=(169, 169, 184), width=SC)
+    d.ellipse([nx - 4 * SC, ny - 4 * SC, nx + 4 * SC, ny + 4 * SC], fill=HEX["text"])
+    d.line([L, cy1, R, cy1], fill=(92, 92, 100), width=SC)
+    y = cy1 + 10 * SC
+    d.text((L, y), "Темп 14%/ч · к сбросу ≈88% — хватит", font=small, fill=(169, 169, 184))
+    y += 30 * SC
+    d.text((L, y), "Неделя", font=sans, fill=HEX["text"])
+    t = "23.0% · ↻ 4д 5ч"
+    d.text((R - d.textlength(t, font=sans), y), t, font=sans, fill=HEX["text"])
+    y += 24 * SC
+    d.rounded_rectangle([L, y, R, y + 6 * SC], radius=3 * SC, fill=(64, 64, 72))
+    d.rounded_rectangle([L, y, L + cw * 0.23, y + 6 * SC], radius=3 * SC, fill=HEX["accent"])
+    y += 18 * SC
+    d.text((L, y), "Claude сегодня ≈$58.73 по ценам API · opencode $1.28", font=small, fill=(169, 169, 184))
+    y += 30 * SC
+    d.line([L, y, R, y], fill=(58, 58, 66), width=SC)
+    y += 12 * SC
+    for item in ("Открыть AgentOp", "Диспетчер задач", "Обновить сейчас", "Вид индикатора  ›"):
+        d.text((L, y), item, font=sans, fill=HEX["text"])
+        y += 30 * SC
+    img.resize((W, H), Image.LANCZOS).save(path, optimize=True)
+
+
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
     cfg = dict(m.DEFAULT_CONFIG)
@@ -147,8 +278,12 @@ def main():
             lines.pop()
         to_png(lines, OUT / f"{view}.png")
         print("✓", view)
-    # верхняя панель: все стили индикатора
-    print("готово:", OUT)
+    widget_dir = ROOT / "docs" / "widget"
+    widget_dir.mkdir(parents=True, exist_ok=True)
+    widget_styles(widget_dir / "styles.png")
+    widget_menu(widget_dir / "menu.png")
+    print("✓ widget")
+    print("готово:", OUT, widget_dir)
 
 
 if __name__ == "__main__":

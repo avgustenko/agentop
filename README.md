@@ -72,6 +72,12 @@ Rendered from sample data with `python3 docs/make_screenshots.py`.
 
 `gnome-extension/agentop@avgustenko` (GNOME 45–50) shows the limit in the top bar; the menu has a 5h window chart with the forecast, the weekly window, today's cost and buttons to open AgentOp or the task manager. Nine indicator styles are selectable from the menu. It polls `agentop --json` every 30 s and does no networking itself.
 
+| Menu | Nine indicator styles |
+|---|---|
+| ![Widget menu](docs/widget/menu.png) | ![Indicator styles](docs/widget/styles.png) |
+
+Install with `./install.sh`, log out and back in once, then click the indicator. Yellow means 80%+, red 95%+. The images are rendered from the extension's code with sample data.
+
 ## Settings
 
 Press `s` in the live view. Change the refresh interval from **0.01 s to 300 s**, theme, view, sparkline history, decimals and which sections to show. Changes are saved to `~/.config/agentop/config.json` immediately.
