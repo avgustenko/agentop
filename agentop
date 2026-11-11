@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-agentop 1.2.0 — терминальный дашборд агентов и железа.
+agentop 1.2.1 — терминальный дашборд агентов и железа.
 
   agentop                 живой виджет
   agentop --once          один кадр
@@ -43,7 +43,7 @@ try:
 except ImportError:
     termios = tty = None
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 VIEWS = ("dashboard", "focus", "system", "compact", "minimal")
 COLOR = (sys.stdout.isatty() and "NO_COLOR" not in os.environ
          and os.environ.get("TERM") != "dumb")
@@ -1639,6 +1639,7 @@ def render_settings(app, W, H, sel):
         row = f"  {t.c('accent' if i == sel else 'dim', pointer)} {label:<22} {t.c('text', vtxt)}"
         out.append(content_line(t, W, row))
     out.append(content_line(t, W, t.c("dim", "  Обновление: 0.01 … 300 с · ←/→ меняет значение")))
+    out.append(content_line(t, W, t.c("dim", "  Меньше интервал — выше нагрузка (0.01 с ≈ 100 FPS).")))
     out.append(frame_bottom(t, W, t.c("dim", "↑↓ выбор   ←→ изменить   s закрыть")))
     return [clip(x, W) for x in out][:H]
 
@@ -2014,6 +2015,8 @@ def main():
     paused = False
     settings = False
     settings_sel = 0
+    data = None
+    last_sample = 0.0
     try:
         while True:
             if settings:
@@ -2039,6 +2042,7 @@ def main():
                     settings = False
                     last_frame = None
                     last_stamp = None
+                    last_sample = 0.0
                     interval = max(0.01, min(300.0, _as_float(app.cfg.get("interval"), 1.0)))
                     show_ms = bool(args.ms or _as_bool(app.cfg.get("clock_ms"), False))
                     continue
@@ -2077,6 +2081,7 @@ def main():
                     paused = False
                     last_frame = None
                     last_stamp = None
+                    last_sample = 0.0
                 elif ch in ("s", "S"):
                     paused = False
                     settings = True
@@ -2093,9 +2098,18 @@ def main():
                 H = max(20, size.lines)
                 last_size_check = now
 
-            data = app.sample()
+            if data is None or now - last_sample >= interval:
+                data = app.sample()
+                last_sample = now
+                last_stamp = None
+            else:
+                cached_limits = app.cache.get("limits")
+                if cached_limits is not data.get("limits"):
+                    data["limits"] = cached_limits
+                    last_stamp = None
+
             stamp = (data["version"], int(now), W, H, app.theme.name)
-            if show_ms or stamp != last_stamp:
+            if last_stamp is None or show_ms or stamp != last_stamp:
                 frame = "\n".join(render(app, data, W, H, show_ms=show_ms))
                 if frame != last_frame:
                     sys.stdout.write("\033[H\033[J" + frame)
@@ -2103,7 +2117,7 @@ def main():
                     last_frame = frame
                 last_stamp = stamp
 
-            wait = max(0.0, interval - (time.time() - tick_start))
+            wait = min(interval, 0.5)
             r, _, _ = select.select([fd], [], [], wait)
             if not r:
                 continue
@@ -2119,6 +2133,7 @@ def main():
                 app.force_limits = True
                 app.speed.claude = ClaudeTail(1800)
                 app.speed.update(force=True)
+                last_sample = 0.0
                 last_frame = None
                 last_stamp = None
             elif ch in ("t", "T"):
