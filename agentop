@@ -2698,6 +2698,12 @@ def lim_info(data, label, key):
     pts = list((data.get("limits_hist") or {}).get(label) or [])
     rate = recent_rate(pts + [(now, used)]) if pts else None
     proj = used + rate * rem if (rate is not None and rem and rem > 0) else None
+    wlen = dict((lb, wl) for lb, _, wl in LIMIT_WINDOWS).get(label, 5 * 3600)
+    if wlen > 86400 and rem is not None:
+        # неделя: темп 30 минут на 6 дней вперёд не экстраполируем — берём средний темп окна
+        elapsed = wlen - rem
+        rate = used / elapsed if elapsed > 6 * 3600 else None
+        proj = used * wlen / elapsed if elapsed > 6 * 3600 else None
     return {"used": used, "reset": reset, "rem": rem, "expired": window_expired(o),
             "pts": pts, "rate": rate, "proj": proj}
 
@@ -3744,7 +3750,31 @@ def json_out(app, data):
                    "net": data["net"], "iface": data["iface"],
                    "uptime": data["uptime"]},
         "processes": data["procs"],
+        "panel": panel_json(app, data),
     }, ensure_ascii=False, indent=2)
+
+
+def panel_json(app, data):
+    """Готовые числа для расширения GNOME: окна, тренд, прогноз, история, скорость."""
+    out = {"style": app.cfg.get("panel_style") or "text", "styles": list(PANEL_STYLES),
+           "now": time.time(), "error": (data.get("limits") or {}).get("error")}
+    for label, key, wlen in LIMIT_WINDOWS:
+        info = lim_info(data, label, key)
+        if not info:
+            out[label] = None
+            continue
+        out[label] = {"used": info["used"], "reset": info["reset"], "rem": info["rem"],
+                      "expired": info["expired"], "rate_h": info["rate"] * 3600 if info["rate"] is not None else None,
+                      "proj": info["proj"], "window": wlen,
+                      "history": [[round(a), b] for a, b in info["pts"]][-120:]}
+    now_s, peak, buckets = _speed_now(data)
+    ctot = (data.get("claude") or {}).get("totals") or {}
+    otot = (data.get("opencode") or {}).get("today") or {}
+    out["speed"] = {"now": now_s, "peak": peak, "buckets": buckets}
+    out["claude_cost_api"] = float(ctot.get("cost_api") or 0)
+    out["claude_out"] = int(ctot.get("output") or 0)
+    out["opencode_cost"] = float(otot.get("cost") or 0)
+    return out
 
 
 # ───────────────────────────── main ─────────────────────────────
@@ -3755,6 +3785,7 @@ def main():
     ap.add_argument("--json", action="store_true", help="JSON")
     ap.add_argument("--waybar", action="store_true", help="JSON для модуля custom в Waybar")
     ap.add_argument("--argos", action="store_true", help="вывод для GNOME-расширения Argos")
+    ap.add_argument("--set-panel-style", choices=PANEL_STYLES, help="сохранить стиль индикатора панели")
     ap.add_argument("--panel-style", choices=PANEL_STYLES,
                     help="стиль индикатора для --argos: " + ", ".join(PANEL_STYLES))
     ap.add_argument("--refresh", "-r", action="store_true", help="сбросить кэш")
@@ -3808,6 +3839,11 @@ def main():
         cfg["theme"] = name
         save_config(cfg)
         print(f"тема сохранена: {name}")
+        return
+
+    if args.set_panel_style:
+        persist_setting("panel_style", args.set_panel_style)
+        print(f"стиль панели сохранён: {args.set_panel_style}")
         return
 
     if args.config:

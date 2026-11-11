@@ -1,0 +1,8 @@
+{
+  "uuid": "agentop@avgustenko",
+  "name": "AgentOp",
+  "description": "Лимиты Claude в верхней панели: окно 5 часов, неделя, прогноз к сбросу, стоимость за день. Данные берёт из agentop --json.",
+  "shell-version": ["45", "46", "47", "48", "49", "50"],
+  "url": "https://github.com/avgustenko/agentop",
+  "version": 1
+}
