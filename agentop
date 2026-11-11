@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-agentop 1.0.0 — терминальный дашборд агентов и железа.
+agentop 1.2.0 — терминальный дашборд агентов и железа.
 
   agentop                 живой виджет
   agentop --once          один кадр
@@ -43,7 +43,7 @@ try:
 except ImportError:
     termios = tty = None
 
-VERSION = "1.1.1"
+VERSION = "1.2.0"
 VIEWS = ("dashboard", "focus", "system", "compact", "minimal")
 COLOR = (sys.stdout.isatty() and "NO_COLOR" not in os.environ
          and os.environ.get("TERM") != "dumb")
@@ -1513,9 +1513,134 @@ def _footer(app, W, paused):
     if paused:
         hint = f"{key(t, 'p')} продолжить   {key(t, 'q')} выход"
     else:
-        hint = (f"{key(t, 'r')} обновить   {key(t, 't')} тема   {key(t, 'v')} вид   "
-                f"{key(t, 'p')} пауза   {key(t, 'q')} выход")
+        hint = (f"{key(t, 'r')} обновить  {key(t, 't')} тема  {key(t, 'v')} вид  "
+                f"{key(t, 's')} настройки  {key(t, 'p')} пауза  {key(t, 'q')} выход")
     return frame_bottom(t, W, hint)
+
+
+INTERVAL_CHOICES = [0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0,
+                    5.0, 10.0, 30.0, 60.0, 120.0, 300.0]
+HISTORY_CHOICES = [60, 120, 240, 480, 960, 1920]
+HISTORY_STEP_CHOICES = [0.5, 1.0, 2.0, 5.0, 10.0, 30.0]
+DECIMALS_CHOICES = [0, 1, 2, 3, 4, 5, 6]
+BOOL_CHOICES = [False, True]
+
+
+def settings_items(cfg):
+    return [
+        ("interval", "Обновление", INTERVAL_CHOICES),
+        ("theme", "Тема", ["auto"] + list(THEMES)),
+        ("view", "Вид", list(VIEWS)),
+        ("history", "История", HISTORY_CHOICES),
+        ("history_interval", "Шаг истории", HISTORY_STEP_CHOICES),
+        ("limit_decimals", "Знаков в лимитах", DECIMALS_CHOICES),
+        ("clock_ms", "Сантисекунды", BOOL_CHOICES),
+        ("show.network", "Сеть", BOOL_CHOICES),
+        ("show.disk", "Диск", BOOL_CHOICES),
+        ("show.processes", "Процессы", BOOL_CHOICES),
+        ("show.gpu", "GPU", BOOL_CHOICES),
+        ("show.per_core", "Ядра CPU", BOOL_CHOICES),
+    ]
+
+
+def setting_get(cfg, key):
+    if key.startswith("show."):
+        return _as_bool(_show_cfg(cfg).get(key[5:]), True)
+    return cfg.get(key)
+
+
+def setting_set(cfg, key, value):
+    if key.startswith("show."):
+        show = dict(_show_cfg(cfg))
+        show[key[5:]] = bool(value)
+        cfg["show"] = show
+    else:
+        cfg[key] = value
+
+
+def choice_index(choices, value):
+    try:
+        return choices.index(value)
+    except ValueError:
+        numeric = all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in choices)
+        if numeric:
+            return min(range(len(choices)), key=lambda i: abs(float(choices[i]) - float(value)))
+        return 0
+
+
+def fmt_setting(key, value):
+    if key == "interval":
+        v = float(value)
+        return f"{v:.2f} с" if v < 1 else f"{v:g} с"
+    if key == "history_interval":
+        return f"{float(value):g} с"
+    if key == "history":
+        return f"{value} точек"
+    if key == "limit_decimals":
+        return str(value)
+    if isinstance(value, bool):
+        return "вкл" if value else "выкл"
+    return str(value)
+
+
+def apply_setting(app, key, value):
+    cfg = app.cfg
+    setting_set(cfg, key, value)
+    if key == "theme":
+        app.theme = Theme(value)
+    elif key == "view":
+        if value in VIEWS:
+            app.view = value
+    elif key == "history":
+        n = _as_int(value, 120, 10, 5000)
+        app.h_cpu = deque(app.h_cpu, maxlen=n)
+        app.h_load = deque(app.h_load, maxlen=n)
+        app.h_temp = deque(app.h_temp, maxlen=n)
+        app.h_io = deque(app.h_io, maxlen=n)
+    save_config(cfg)
+
+
+def read_key(fd):
+    def read1():
+        try:
+            return os.read(fd, 1).decode("utf-8", "ignore")
+        except OSError:
+            return ""
+
+    ch = read1()
+    if ch != "\x1b":
+        return ch
+    r, _, _ = select.select([fd], [], [], 0.02)
+    if not r:
+        return "ESC"
+    seq = read1()
+    if seq == "[":
+        r, _, _ = select.select([fd], [], [], 0.02)
+        if not r:
+            return "ESC"
+        code = read1()
+        return {"A": "UP", "B": "DOWN", "C": "RIGHT", "D": "LEFT"}.get(code, "ESC")
+    return "ESC"
+
+
+def render_settings(app, W, H, sel):
+    t = app.theme
+    ts = datetime.now().strftime("%H:%M:%S")
+    left = (f"{t.c('accent', 'AGENTOP')} {t.c('dim', VERSION)} "
+            f"{t.c('dim', '·')} {t.c('text', 'настройки')}")
+    top = frame_top(t, W, left, t.c("dim", ts))
+    cw = W - 4
+    items = settings_items(app.cfg)
+    out = [top, content_line(t, W, head(t, cw, "НАСТРОЙКИ"))]
+    for i, (key, label, choices) in enumerate(items):
+        val = setting_get(app.cfg, key)
+        vtxt = fmt_setting(key, val)
+        pointer = "›" if i == sel else " "
+        row = f"  {t.c('accent' if i == sel else 'dim', pointer)} {label:<22} {t.c('text', vtxt)}"
+        out.append(content_line(t, W, row))
+    out.append(content_line(t, W, t.c("dim", "  Обновление: 0.01 … 300 с · ←/→ меняет значение")))
+    out.append(frame_bottom(t, W, t.c("dim", "↑↓ выбор   ←→ изменить   s закрыть")))
+    return [clip(x, W) for x in out][:H]
 
 
 def limits_title(data):
@@ -1851,7 +1976,7 @@ def main():
     if args.refresh:
         app.force_limits = True
     interval = max(0.01, args.interval if args.interval is not None
-                   else _as_float(cfg.get("interval"), 1.0, 0.01, 3600.0))
+                   else _as_float(cfg.get("interval"), 1.0, 0.01, 300.0))
     if args.ms and args.interval is None and interval > 0.05:
         interval = 0.01
     show_ms = bool(args.ms or _as_bool(cfg.get("clock_ms"), False))
@@ -1884,23 +2009,80 @@ def main():
     time.sleep(0.35)
     last_frame = None
     last_stamp = None
+    last_settings_stamp = None
     last_size_check = 0.0
     paused = False
+    settings = False
+    settings_sel = 0
     try:
         while True:
-            if paused:
-                r, _, _ = select.select([sys.stdin], [], [], None)
+            if settings:
+                now_s = time.time()
+                if now_s - last_size_check >= 0.5:
+                    size = shutil.get_terminal_size((80, 24))
+                    W = max(52, min(size.columns - 1, 120))
+                    H = max(20, size.lines)
+                    last_size_check = now_s
+                stamp_s = (int(now_s), settings_sel, app.theme.name)
+                if stamp_s != last_settings_stamp:
+                    frame = "\n".join(render_settings(app, W, H, settings_sel))
+                    if frame != last_frame:
+                        sys.stdout.write("\033[H\033[J" + frame)
+                        sys.stdout.flush()
+                        last_frame = frame
+                    last_settings_stamp = stamp_s
+                r, _, _ = select.select([fd], [], [], 0.2)
                 if not r:
                     continue
-                ch = sys.stdin.read(1)
+                k = read_key(fd)
+                if k in ("s", "S", "ESC", "q", "Q", "\x03"):
+                    settings = False
+                    last_frame = None
+                    last_stamp = None
+                    interval = max(0.01, min(300.0, _as_float(app.cfg.get("interval"), 1.0)))
+                    show_ms = bool(args.ms or _as_bool(app.cfg.get("clock_ms"), False))
+                    continue
+                items = settings_items(app.cfg)
+                if k in ("UP", "k", "K"):
+                    settings_sel = (settings_sel - 1) % len(items)
+                    last_settings_stamp = None
+                elif k in ("DOWN", "j", "J"):
+                    settings_sel = (settings_sel + 1) % len(items)
+                    last_settings_stamp = None
+                elif k in ("LEFT", "h", "H", "RIGHT", "l", "L", "ENTER", "\r", "\n"):
+                    key_, label, choices = items[settings_sel]
+                    cur = setting_get(app.cfg, key_)
+                    idx = choice_index(choices, cur)
+                    if k in ("LEFT", "h", "H"):
+                        idx = (idx - 1) % len(choices)
+                    elif isinstance(choices[0], bool):
+                        idx = 1 - idx
+                    else:
+                        idx = (idx + 1) % len(choices)
+                    apply_setting(app, key_, choices[idx])
+                    last_frame = None
+                    last_settings_stamp = None
+                continue
+
+            if paused:
+                r, _, _ = select.select([fd], [], [], None)
+                if not r:
+                    continue
+                ch = read_key(fd)
                 if not ch:
                     break
-                if ch in ("q", "Q", "\x03", "\x1b"):
+                if ch in ("q", "Q", "\x03", "ESC"):
                     break
                 if ch in ("p", "P"):
                     paused = False
                     last_frame = None
                     last_stamp = None
+                elif ch in ("s", "S"):
+                    paused = False
+                    settings = True
+                    settings_sel = 0
+                    last_settings_stamp = None
+                    last_frame = None
                 continue
 
             tick_start = time.time()
@@ -1922,13 +2104,13 @@ def main():
                 last_stamp = stamp
 
             wait = max(0.0, interval - (time.time() - tick_start))
-            r, _, _ = select.select([sys.stdin], [], [], wait)
+            r, _, _ = select.select([fd], [], [], wait)
             if not r:
                 continue
-            ch = sys.stdin.read(1)
+            ch = read_key(fd)
             if not ch:
                 break
-            if ch in ("q", "Q", "\x03", "\x1b"):
+            if ch in ("q", "Q", "\x03", "ESC"):
                 break
             if ch in ("r", "R"):
                 clear_cache()
@@ -1948,13 +2130,6 @@ def main():
                 save_config(cfg)
                 last_frame = None
                 last_stamp = None
-            elif ch in ("p", "P"):
-                paused = True
-                frame = "\n".join(render(app, data, W, H, show_ms=show_ms, paused=True))
-                if frame != last_frame:
-                    sys.stdout.write("\033[H\033[J" + frame)
-                    sys.stdout.flush()
-                    last_frame = frame
             elif ch in ("v", "V"):
                 idx = VIEWS.index(app.view) if app.view in VIEWS else 0
                 app.view = VIEWS[(idx + 1) % len(VIEWS)]
@@ -1962,6 +2137,18 @@ def main():
                 save_config(cfg)
                 last_frame = None
                 last_stamp = None
+            elif ch in ("s", "S"):
+                settings = True
+                settings_sel = 0
+                last_settings_stamp = None
+                last_frame = None
+            elif ch in ("p", "P"):
+                paused = True
+                frame = "\n".join(render(app, data, W, H, show_ms=show_ms, paused=True))
+                if frame != last_frame:
+                    sys.stdout.write("\033[H\033[J" + frame)
+                    sys.stdout.flush()
+                    last_frame = frame
     except (KeyboardInterrupt, OSError):
         pass
     finally:

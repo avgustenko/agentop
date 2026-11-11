@@ -3,7 +3,7 @@
 **A terminal dashboard for AI coding agents** — Claude limits, token spend, token speed and system health in one live TUI. Think `top`, but for your agents + machine.
 
 ```
-╭─ ● AGENTOP 1.1.1 · catppuccin-mocha ─────────────── 15:42:07 · 88% · 46°C · up 30м ─╮
+╭─ ● AGENTOP 1.2.0 · catppuccin-mocha ─────────────── 15:42:07 · 88% · 46°C · up 30м ─╮
 │ ▐ LIMITS ───────────────────────────────────── │ ▐ CPU ────────────────────────────────────── │
 │   5h  ░░░░░░░░░░░░ 0.000%  ↻ 4ч 32м            │   total ██░░░░░░░░░░  15%  ▁                  │
 │   7d  ███░░░░░░░░░ 23.000%  ↻ 14ч 02м          │   C0 █████ 100  C1 ░░░░░   2  C2 ░░░░░   9   │
@@ -49,6 +49,12 @@ Switch views with `v` (saved to config) or `--view`:
 agentop --view focus
 agentop --list-views
 ```
+
+## Settings
+
+Press `s` in the live view. Change the refresh interval from **0.01 s to 300 s**, theme, view, sparkline history, decimals and which sections to show. Changes are saved to `~/.config/agentop/config.json` immediately.
+
+![](docs/settings.png)
 
 ## Themes
 
@@ -110,6 +116,7 @@ In the live view:
 | `r` | refresh now (caches + limits) |
 | `t` | next theme (saved to config) |
 | `v` | next view (saved to config) |
+| `s` | settings screen (interval 0.01–300 s) |
 | `p` | pause / resume (0 % CPU while paused) |
 | `q` | quit |
 
