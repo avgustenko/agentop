@@ -301,3 +301,89 @@ class CliTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReviewFixTests(unittest.TestCase):
+    """Регрессии из ревизии 1.2.2."""
+
+    def key(self, raw):
+        r, w = os.pipe()
+        try:
+            os.write(w, raw)
+            os.close(w)
+            w = None
+            return mod.read_key(r)
+        finally:
+            os.close(r)
+            if w is not None:
+                os.close(w)
+
+    def test_read_key_russian_layout(self):
+        # раньше: пустая строка → живой режим завершался
+        self.assertEqual(self.key("к".encode()), "r")
+        self.assertEqual(self.key("й".encode()), "q")
+        self.assertEqual(self.key("ы".encode()), "s")
+
+    def test_read_key_eof_and_arrows(self):
+        self.assertIsNone(self.key(b""))
+        self.assertEqual(self.key(b"\x1b[A"), "UP")
+        self.assertEqual(self.key(b"\x1bOB"), "DOWN")
+        self.assertEqual(self.key(b"q"), "q")
+        self.assertEqual(self.key("ж".encode()), "ж")
+
+    def test_age_label_long(self):
+        self.assertEqual(mod.age_label(3 * 3600), "3ч")
+        self.assertEqual(mod.age_label(3 * 86400), "3д")
+
+    def test_window_expired(self):
+        past = {"utilization": 100, "resets_at": "2000-01-01T00:00:00+00:00"}
+        future = {"utilization": 100, "resets_at": "2999-01-01T00:00:00+00:00"}
+        self.assertTrue(mod.window_expired(past))
+        self.assertFalse(mod.window_expired(future))
+        self.assertFalse(mod.window_expired({}))
+        t = mod.Theme("mono")
+        lines = mod.limits_lines({"five_hour": past, "seven_day": future}, t, 100)
+        text = "\n".join(lines)
+        self.assertIn("окно сброшено", text)
+        self.assertNotIn("5h лимит исчерпан", text)
+        self.assertIn("7d лимит исчерпан", text)
+
+    def test_procs_current_cpu(self):
+        p = mod.Procs()
+        self.assertTrue(p.prev)
+        end = __import__("time").time() + 0.3
+        while __import__("time").time() < end:
+            pass  # нагружаем CPU тестовым процессом
+        others = mod.Procs()
+        others.prev = p.prev
+        others.last = p.last
+        top = others.top(50)
+        self.assertTrue(all(len(x) == 3 for x in top))
+        self.assertTrue(all(x[0] >= 0 for x in top))
+
+    def test_persist_does_not_leak_overrides(self):
+        saved = {}
+        old_load, old_save = mod.load_config, mod.save_config
+        mod.load_config = lambda: copy.deepcopy(mod.DEFAULT_CONFIG)
+        mod.save_config = lambda cfg: saved.update(copy.deepcopy(cfg))
+        try:
+            app = make_app()
+            app.cfg["theme"] = "nord"  # разовый --theme
+            mod.apply_setting(app, "view", "focus")
+        finally:
+            mod.load_config, mod.save_config = old_load, old_save
+        self.assertEqual(saved["view"], "focus")
+        self.assertEqual(saved["theme"], mod.DEFAULT_CONFIG["theme"])
+
+    def test_root_disk_in_diskstats(self):
+        dev = mod.DiskIO._root_disk()
+        if Path("/proc/diskstats").exists():
+            names = [l.split()[2] for l in Path("/proc/diskstats").read_text().splitlines()]
+            self.assertIn(dev, names)
+
+    def test_bad_theme_exit_code(self):
+        env = dict(os.environ, NO_COLOR="1")
+        for args in (["--set-theme", "nope"], ["--theme", "nope", "--once"]):
+            r = subprocess.run([sys.executable, str(SCRIPT), *args],
+                               capture_output=True, text=True, env=env, timeout=30)
+            self.assertEqual(r.returncode, 2, args)

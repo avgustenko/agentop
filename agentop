@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-agentop 1.2.1 — терминальный дашборд агентов и железа.
+agentop 1.2.2 — терминальный дашборд агентов и железа.
 
   agentop                 живой виджет
   agentop --once          один кадр
@@ -13,7 +13,8 @@ agentop 1.2.1 — терминальный дашборд агентов и же
   agentop --config        путь к конфигу
   agentop --ms            часы с сантисекундами (~100 FPS)
 
-В живом режиме: r — обновить, t — сменить тему, p — пауза, q — выход.
+В живом режиме: r — обновить, t — тема, v — вид, s — настройки, p — пауза,
+q — выход (работает и в русской раскладке).
 
 Данные: лимиты Claude (официальный OAuth-эндпоинт), логи Claude Code,
 SQLite opencode, /proc, /sys. Секреты не выводятся и не кэшируются.
@@ -43,7 +44,7 @@ try:
 except ImportError:
     termios = tty = None
 
-VERSION = "1.2.1"
+VERSION = "1.2.2"
 VIEWS = ("dashboard", "focus", "system", "compact", "minimal")
 COLOR = (sys.stdout.isatty() and "NO_COLOR" not in os.environ
          and os.environ.get("TERM") != "dumb")
@@ -397,7 +398,20 @@ def age_label(seconds):
     seconds = int(max(0, seconds))
     if seconds < 90:
         return f"{seconds}с"
-    return f"{seconds // 60}м"
+    if seconds < 2 * 3600:
+        return f"{seconds // 60}м"
+    if seconds < 2 * 86400:
+        return f"{seconds // 3600}ч"
+    return f"{seconds // 86400}д"
+
+
+def window_expired(o):
+    """Окно лимита уже сброшено, а данные — из кэша до сброса."""
+    try:
+        reset = datetime.fromisoformat(o["resets_at"].replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return False
+    return reset <= time.time()
 
 
 def claude_limits(ttl=TTL_LIMITS, force=False):
@@ -824,7 +838,19 @@ class DiskIO:
             for line in Path("/proc/mounts").read_text().splitlines():
                 p = line.split()
                 if p[1] == "/":
-                    name = os.path.basename(p[0])
+                    name = os.path.basename(os.path.realpath(p[0]))
+                    if name == "root":
+                        # /dev/root: устройство берём из stat корня
+                        st = os.stat("/")
+                        link = f"/sys/dev/block/{os.major(st.st_dev)}:{os.minor(st.st_dev)}"
+                        if os.path.exists(link):
+                            name = os.path.basename(os.path.realpath(link))
+                    sysdir = Path("/sys/class/block", name)
+                    if (sysdir / "partition").exists():
+                        # раздел → родительский диск (nvme0n1p6 → nvme0n1)
+                        return os.path.basename(os.path.dirname(os.path.realpath(sysdir)))
+                    if sysdir.exists():
+                        return name  # целый диск или dm-N (LUKS/LVM)
                     m = re.match(r"^(nvme\d+n\d+|mmcblk\d+)p\d+$", name)
                     if m:
                         return m.group(1)
@@ -1010,30 +1036,59 @@ def gpu_temp():
     return None
 
 
-def top_procs(n=5):
-    try:
-        out = subprocess.run(
-            ["ps", "-eo", "pid=,pcpu=,pmem=,comm=", "--sort=-pcpu"],
-            capture_output=True, text=True, timeout=2,
-        ).stdout
-    except Exception:
-        return []
-    res = []
-    skip = {os.getpid(), os.getppid()}
-    for line in out.splitlines():
-        p = line.split(None, 3)
-        if len(p) < 4:
-            continue
+class Procs:
+    """Текущая загрузка процессов по дельтам /proc/<pid>/stat между замерами.
+
+    `ps %CPU` — среднее за всю жизнь процесса, поэтому только что
+    нагрузивший CPU процесс в такой топ не попадает. Здесь — среднее
+    за интервал между вызовами top() (как в top/htop: 100% = одно ядро).
+    """
+
+    def __init__(self):
         try:
-            pid = int(p[0])
-        except ValueError:
-            continue
-        if pid in skip or p[3] in ("ps", "agentop"):
-            continue
-        res.append((float(p[1]), float(p[2]), p[3]))
-        if len(res) >= n:
-            break
-    return res
+            self.hz = os.sysconf("SC_CLK_TCK")
+            self.page = os.sysconf("SC_PAGE_SIZE")
+        except (ValueError, OSError, AttributeError):
+            self.hz, self.page = 100, 4096
+        self.prev = self._read()
+        self.last = time.time()
+
+    @staticmethod
+    def _read():
+        out = {}
+        for d in glob.glob("/proc/[0-9]*"):
+            try:
+                raw = Path(d, "stat").read_text()
+            except Exception:
+                continue
+            i, j = raw.find("("), raw.rfind(")")
+            if i < 0 or j < 0:
+                continue
+            f = raw[j + 2:].split()
+            try:
+                # f[11]=utime, f[12]=stime, f[21]=rss (страницы)
+                out[int(d[6:])] = (raw[i + 1:j], int(f[11]) + int(f[12]), int(f[21]))
+            except (ValueError, IndexError):
+                continue
+        return out
+
+    def top(self, n=5):
+        cur = self._read()
+        now = time.time()
+        dt = max(0.05, now - self.last)
+        mem = meminfo()
+        mem_total = (mem[0] * 2**30) if mem and mem[0] else 0
+        skip = {os.getpid()}
+        res = []
+        for pid, (comm, ticks, rss) in cur.items():
+            if pid in skip or pid not in self.prev:
+                continue
+            cpu = max(0, ticks - self.prev[pid][1]) / self.hz / dt * 100.0
+            pmem = rss * self.page / mem_total * 100.0 if mem_total else 0.0
+            res.append((cpu, pmem, comm))
+        self.prev, self.last = cur, now
+        res.sort(key=lambda x: x[0], reverse=True)
+        return res[:n]
 
 
 def uptime():
@@ -1093,6 +1148,10 @@ def limits_lines(lim, t, W, decimals=3):
         used = o.get("utilization")
         if used is None:
             lines.append(f"  {t.c('text', label)}  {t.c('dim', 'нет данных')}")
+            continue
+        if window_expired(o):
+            lines.append(f"  {t.c('text', label)}  {t.c('green', 'окно сброшено')} "
+                         f"{t.c('dim', '· ждём свежие данные')}")
             continue
         used = float(used)
         left = max(0.0, 100.0 - used)
@@ -1179,8 +1238,8 @@ def tokens_lines(cl, oc, t, W):
 
 
 def speed_lines(speed, t, W, big=False):
-    ev = speed.events()
-    if not ev:
+    cutoff = time.time() - 900
+    if not any(e[0] >= cutoff for e in speed.events()):
         return [f"  {t.c('dim', 'нет активности за последние 15 мин')}"]
     s = speed.snapshot()
     now = s["now"]
@@ -1326,6 +1385,7 @@ class App:
         self.disk = DiskIO()
         self.net = NetIO()
         self.bat = Battery()
+        self.procs = Procs()
         self.speed = Speed(1800)
         self.force_limits = False
         self.ts = {}
@@ -1349,6 +1409,7 @@ class App:
         except Exception:
             pass
         self.ts["limits"] = time.time() if threaded else 0.0
+        self._limits_wake = threading.Event()
         if threaded:
             self._limits_thread = threading.Thread(target=self._limits_worker, daemon=True)
             self._limits_thread.start()
@@ -1360,7 +1421,9 @@ class App:
         delay = 0
         while True:
             if delay:
-                time.sleep(delay)
+                # ждём интервал, но просыпаемся сразу по [r]
+                self._limits_wake.wait(delay)
+            self._limits_wake.clear()
             try:
                 data = claude_limits(force=True)
                 ok = (bool(data) and not data.get("error")
@@ -1384,7 +1447,13 @@ class App:
         show = _show_cfg(self.cfg)
         changed = False
 
-        if self.force_limits:
+        worker_alive = self._limits_thread is not None and self._limits_thread.is_alive()
+        if self.force_limits and worker_alive:
+            # сеть — только в фоне, интерфейс не замирает
+            self._limits_wake.set()
+            self.force_limits = False
+            c["limits"] = self.cache.get("limits")
+        elif self.force_limits:
             c["limits"] = claude_limits(force=True)
             self.force_limits = False
             self.ts["limits"] = now
@@ -1396,7 +1465,7 @@ class App:
                 changed = True
             else:
                 c["limits"] = self.cache.get("limits")
-        elif self._due("limits", TTL_LIMITS_FALLBACK):
+        elif not worker_alive and self._due("limits", TTL_LIMITS_FALLBACK):
             c["limits"] = claude_limits()
             self.ts["limits"] = now
             changed = True
@@ -1434,7 +1503,7 @@ class App:
             self.ts["io"] = now
             changed = True
         if procs and self._due("procs", TTL_PROCS):
-            c["procs"] = top_procs(4) if _as_bool(show.get("processes"), True) else []
+            c["procs"] = self.procs.top(4) if _as_bool(show.get("processes"), True) else []
             self.ts["procs"] = now
             changed = True
         if self._due("speed", TTL_SPEED):
@@ -1489,8 +1558,9 @@ def _header(app, data, W, show_ms):
     lim = data.get("limits") or {}
     worst = 0.0
     for key_ in ("five_hour", "seven_day"):
-        u = (lim.get(key_) or {}).get("utilization")
-        if u is not None:
+        o = lim.get(key_) or {}
+        u = o.get("utilization")
+        if u is not None and not window_expired(o):
             worst = max(worst, float(u))
     dot = "red" if lim.get("error") else pct_color(worst)
     left = (f"{t.c(dot, '●')} {t.c('accent', 'AGENTOP')} {t.c('dim', VERSION)} "
@@ -1597,29 +1667,56 @@ def apply_setting(app, key, value):
         app.h_load = deque(app.h_load, maxlen=n)
         app.h_temp = deque(app.h_temp, maxlen=n)
         app.h_io = deque(app.h_io, maxlen=n)
-    save_config(cfg)
+    persist_setting(key, value)
+
+
+def persist_setting(key, value):
+    """Сохранить один ключ, не записывая разовые флаги (--theme, --view) в конфиг."""
+    disk = load_config()
+    setting_set(disk, key, value)
+    save_config(disk)
+
+
+# та же физическая клавиша в русской раскладке (ЙЦУКЕН)
+RU_KEYS = {"к": "r", "К": "R", "е": "t", "Е": "T", "м": "v", "М": "V",
+           "ы": "s", "Ы": "S", "з": "p", "З": "P", "й": "q", "Й": "Q",
+           "л": "k", "Л": "K", "о": "j", "О": "J", "р": "h", "Р": "H",
+           "д": "l", "Д": "L"}
 
 
 def read_key(fd):
+    """Одна клавиша. None — конец ввода (EOF/ошибка), "" — непонятный байт."""
     def read1():
         try:
-            return os.read(fd, 1).decode("utf-8", "ignore")
+            return os.read(fd, 1)
         except OSError:
-            return ""
+            return b""
 
-    ch = read1()
-    if ch != "\x1b":
-        return ch
+    b = read1()
+    if not b:
+        return None
+    if b != b"\x1b":
+        # UTF-8: дочитываем продолжение многобайтного символа
+        need = 1 if b[0] >= 0xC0 else 0
+        need += 1 if b[0] >= 0xE0 else 0
+        need += 1 if b[0] >= 0xF0 else 0
+        for _ in range(need):
+            r, _, _ = select.select([fd], [], [], 0.02)
+            if not r:
+                break
+            b += read1()
+        ch = b.decode("utf-8", "ignore")
+        return RU_KEYS.get(ch, ch)
     r, _, _ = select.select([fd], [], [], 0.02)
     if not r:
         return "ESC"
     seq = read1()
-    if seq == "[":
+    if seq in (b"[", b"O"):
         r, _, _ = select.select([fd], [], [], 0.02)
         if not r:
             return "ESC"
         code = read1()
-        return {"A": "UP", "B": "DOWN", "C": "RIGHT", "D": "LEFT"}.get(code, "ESC")
+        return {b"A": "UP", b"B": "DOWN", b"C": "RIGHT", b"D": "LEFT"}.get(code, "ESC")
     return "ESC"
 
 
@@ -1773,6 +1870,9 @@ def _minimal_view(app, data, W, H, show_ms, paused):
         if used is None:
             out.append(content_line(t, W, f"  {t.c('text', label)}  {t.c('dim', 'нет данных')}"))
             continue
+        if window_expired(o):
+            out.append(content_line(t, W, f"  {t.c('text', label)}  {t.c('green', 'окно сброшено')}"))
+            continue
         used = float(used)
         rem = ""
         if o.get("resets_at"):
@@ -1870,7 +1970,9 @@ def short(app, data):
     else:
         for label, key in (("5h", "five_hour"), ("7d", "seven_day")):
             o = lim.get(key) or {}
-            if o.get("utilization") is not None:
+            if o.get("utilization") is not None and window_expired(o):
+                parts.append(f"{label} reset")
+            elif o.get("utilization") is not None:
                 parts.append(f"{label} {max(0, 100 - float(o['utilization'])):.0f}% left")
     parts.append(f"{data['speed'].rate(60):.0f} tok/s")
     otot = (data["opencode"] or {}).get("today") or {}
@@ -1964,7 +2066,12 @@ def main():
         return
 
     if args.theme:
+        if args.theme not in THEMES and args.theme != "auto":
+            print(f"неизвестная тема: {args.theme} (см. --list-themes)", file=sys.stderr)
+            return 2
         cfg["theme"] = args.theme
+    if args.view:
+        cfg["view"] = args.view
     if args.refresh:
         clear_cache()
 
@@ -1997,8 +2104,14 @@ def main():
             print("\n".join(render(app, data, W, H, show_ms=show_ms)))
         return
 
-    # живой режим
+    # живой режим: альтернативный экран, курсор скрыт — терминал пользователя не затирается
+    def draw(frame):
+        # без полной очистки: каждая строка дочищается до конца (\033[K) — нет мерцания
+        sys.stdout.write("\033[H" + frame.replace("\n", "\033[K\n") + "\033[K\033[J")
+
     fd = sys.stdin.fileno()
+    sys.stdout.write("\033[?1049h\033[?25l")
+    sys.stdout.flush()
     old_term = None
     if termios and tty and sys.stdin.isatty():
         try:
@@ -2030,7 +2143,7 @@ def main():
                 if stamp_s != last_settings_stamp:
                     frame = "\n".join(render_settings(app, W, H, settings_sel))
                     if frame != last_frame:
-                        sys.stdout.write("\033[H\033[J" + frame)
+                        draw(frame)
                         sys.stdout.flush()
                         last_frame = frame
                     last_settings_stamp = stamp_s
@@ -2038,6 +2151,8 @@ def main():
                 if not r:
                     continue
                 k = read_key(fd)
+                if k is None:
+                    break
                 if k in ("s", "S", "ESC", "q", "Q", "\x03"):
                     settings = False
                     last_frame = None
@@ -2073,7 +2188,7 @@ def main():
                 if not r:
                     continue
                 ch = read_key(fd)
-                if not ch:
+                if ch is None:
                     break
                 if ch in ("q", "Q", "\x03", "ESC"):
                     break
@@ -2112,7 +2227,7 @@ def main():
             if last_stamp is None or show_ms or stamp != last_stamp:
                 frame = "\n".join(render(app, data, W, H, show_ms=show_ms))
                 if frame != last_frame:
-                    sys.stdout.write("\033[H\033[J" + frame)
+                    draw(frame)
                     sys.stdout.flush()
                     last_frame = frame
                 last_stamp = stamp
@@ -2122,14 +2237,17 @@ def main():
             if not r:
                 continue
             ch = read_key(fd)
-            if not ch:
+            if ch is None:
                 break
             if ch in ("q", "Q", "\x03", "ESC"):
                 break
             if ch in ("r", "R"):
                 clear_cache()
                 app.ts.clear()
+                kept = app.cache.get("limits")
                 app.cache.clear()
+                if kept:
+                    app.cache["limits"] = kept
                 app.force_limits = True
                 app.speed.claude = ClaudeTail(1800)
                 app.speed.update(force=True)
@@ -2142,14 +2260,14 @@ def main():
                 nxt = names[(names.index(cur) + 1) % len(names)] if cur in names else names[0]
                 app.theme = Theme(nxt)
                 cfg["theme"] = nxt
-                save_config(cfg)
+                persist_setting("theme", nxt)
                 last_frame = None
                 last_stamp = None
             elif ch in ("v", "V"):
                 idx = VIEWS.index(app.view) if app.view in VIEWS else 0
                 app.view = VIEWS[(idx + 1) % len(VIEWS)]
                 cfg["view"] = app.view
-                save_config(cfg)
+                persist_setting("view", app.view)
                 last_frame = None
                 last_stamp = None
             elif ch in ("s", "S"):
@@ -2161,7 +2279,7 @@ def main():
                 paused = True
                 frame = "\n".join(render(app, data, W, H, show_ms=show_ms, paused=True))
                 if frame != last_frame:
-                    sys.stdout.write("\033[H\033[J" + frame)
+                    draw(frame)
                     sys.stdout.flush()
                     last_frame = frame
     except (KeyboardInterrupt, OSError):
@@ -2177,11 +2295,11 @@ def main():
         except Exception:
             pass
         try:
-            sys.stdout.write("\033[H\033[J")
+            sys.stdout.write("\033[?25h\033[?1049l")
             sys.stdout.flush()
         except Exception:
             pass
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -3,7 +3,7 @@
 **A terminal dashboard for AI coding agents** — Claude limits, token spend, token speed and system health in one live TUI. Think `top`, but for your agents + machine.
 
 ```
-╭─ ● AGENTOP 1.2.1 · catppuccin-mocha ─────────────── 15:42:07 · 88% · 46°C · up 30м ─╮
+╭─ ● AGENTOP 1.2.2 · catppuccin-mocha ─────────────── 15:42:07 · 88% · 46°C · up 30м ─╮
 │ ▐ LIMITS ───────────────────────────────────── │ ▐ CPU ────────────────────────────────────── │
 │   5h  ░░░░░░░░░░░░ 0.000%  ↻ 4ч 32м            │   total ██░░░░░░░░░░  15%  ▁                  │
 │   7d  ███░░░░░░░░░ 23.000%  ↻ 14ч 02м          │   C0 █████ 100  C1 ░░░░░   2  C2 ░░░░░   9   │
