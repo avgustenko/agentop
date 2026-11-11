@@ -3,7 +3,7 @@
 **A terminal dashboard for AI coding agents** — Claude limits, token spend, token speed and system health in one live TUI. Think `top`, but for your agents + machine.
 
 ```
-╭─ ● AGENTOP 1.3.0 · catppuccin-mocha ─────────────── 15:42:07 · 88% · 46°C · up 30м ─╮
+╭─ ● AGENTOP 1.4.0 · catppuccin-mocha ─────────────── 15:42:07 · 88% · 46°C · up 30м ─╮
 │ ▐ LIMITS ───────────────────────────────────── │ ▐ CPU ────────────────────────────────────── │
 │   5h  ░░░░░░░░░░░░ 0.000%  ↻ 4ч 32м            │   total ██░░░░░░░░░░  15%  ▁                  │
 │   7d  ███░░░░░░░░░ 23.000%  ↻ 14ч 02м          │   C0 █████ 100  C1 ░░░░░   2  C2 ░░░░░   9   │
@@ -36,6 +36,8 @@
 - **Notifications** — `notify-send` at 80 % and 95 % of a window, once per window.
 - **Machine-readable** — `--short` (one line), `--json`, `--waybar` (Waybar custom module) and `--argos` (GNOME top bar via the Argos extension).
 - **Russian keyboard layout** — hotkeys work on ЙЦУКЕН too (`к` = `r`, `й` = `q`, …).
+- **Task manager** — processes grouped by app, search, sort, end with confirmation.
+- **16 views** — from the classic dashboard to gauges, a fuel tank, a live response feed and a weekly heatmap.
 
 ## Views
 
@@ -126,6 +128,26 @@ In the live view:
 | `p` | pause / resume (0 % CPU while paused) |
 | `q` | quit |
 
+## Task manager
+
+Press `d` (or `agentop --view tasks`) for a process list with current CPU, memory and owner, grouped by application by default (all browser processes are one row).
+
+| Key | Action |
+|---|---|
+| `↑` `↓` `PgUp` `PgDn` `Home` `End` | move |
+| `x` / `Del` | end the selected app (asks first) |
+| `y` / `K` / `n` | in the prompt: end / force / cancel |
+| `c` `m` `n` `i` | sort by CPU, memory, name, PID (again to reverse) |
+| `g` | toggle grouping |
+| `/` | filter by name or PID |
+| `d` / `Esc` | back |
+
+Ending works like a system monitor: SIGTERM first; if the app is still running after 3 seconds, AgentOp offers SIGKILL. AgentOp itself, init and kernel threads are blocked; the terminal running AgentOp, session-critical processes and other users' processes get a warning.
+
+## Views
+
+`v` / `V` cycle views; `agentop --list-views` lists them: `dashboard`, `focus`, `timeline`, `gauges`, `fuel`, `brief`, `feed`, `week`, `tiles`, `cockpit`, `sidebar` (auto on terminals narrower than 52 columns), `beacon`, `tasks`, `system`, `compact`, `minimal`.
+
 ## Configuration
 
 `~/.config/agentop/config.json` is created on first run. See [`config.example.json`](config.example.json):
@@ -151,6 +173,7 @@ In the live view:
 - `limit_decimals` — decimals for limit percentages (the API currently returns whole percents, so you'll see `.000`).
 - `show.*` — toggle sections.
 - `notify`, `notify_thresholds` — limit notifications (thresholds in %).
+- `panel_style` — top bar indicator for `--argos`: `text`, `forecast`, `dot`, `cells`, `countdown`, `pulse`, `rotate`, `ring` (PNG ring), `bars` (PNG bars). One-off: `--panel-style ring`.
 - `prices` — override built-in prices: `{"claude-opus-5-5": [input, output, cache write 5m, cache read]}`, USD per 1M tokens.
 
 ### GNOME top bar (Argos)
@@ -193,7 +216,7 @@ exec ~/.local/bin/agentop --argos
 python3 -m unittest discover -s tests -v
 ```
 
-43 tests: formatting, ANSI/clip/pad, theme bars, sparklines, Braille graphs, settings, all views, key input (UTF-8, Russian layout, EOF), pricing, the limits log and trend, notifications, Waybar/Argos output and CLI smoke tests. Tests run with a temporary `HOME`, so they never read your logs or call the API with your token. CI runs them on every push.
+56 tests, including the task manager (ending a real process, SIGTERM → SIGKILL fallback, self-protection), every view at several terminal sizes and panel styles. Earlier: formatting, ANSI/clip/pad, theme bars, sparklines, Braille graphs, settings, all views, key input (UTF-8, Russian layout, EOF), pricing, the limits log and trend, notifications, Waybar/Argos output and CLI smoke tests. Tests run with a temporary `HOME`, so they never read your logs or call the API with your token. CI runs them on every push.
 
 ## License
 
