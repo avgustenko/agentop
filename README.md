@@ -3,7 +3,7 @@
 **A terminal dashboard for AI coding agents** — Claude limits, token spend, token speed and system health in one live TUI. Think `top`, but for your agents + machine.
 
 ```
-╭─ ● AGENTOP 1.0.0 · catppuccin-mocha ─────────────── 15:42:07 · 88% · 46°C · up 30м ─╮
+╭─ ● AGENTOP 1.1.1 · catppuccin-mocha ─────────────── 15:42:07 · 88% · 46°C · up 30м ─╮
 │ ▐ LIMITS ───────────────────────────────────── │ ▐ CPU ────────────────────────────────────── │
 │   5h  ░░░░░░░░░░░░ 0.000%  ↻ 4ч 32м            │   total ██░░░░░░░░░░  15%  ▁                  │
 │   7d  ███░░░░░░░░░ 23.000%  ↻ 14ч 02м          │   C0 █████ 100  C1 ░░░░░   2  C2 ░░░░░   9   │
@@ -139,7 +139,7 @@ In the live view:
 
 | Data | Source |
 |---|---|
-| Claude limits | `https://api.anthropic.com/api/oauth/usage` using your local Claude Code OAuth token (the same endpoint `/usage` uses). Fetched every 5 min in a background thread. |
+| Claude limits | `https://api.anthropic.com/api/oauth/usage` using your local Claude Code OAuth token (the same endpoint `/usage` uses). Fetched every 30 s in a background thread; `r` forces an immediate refresh. The LIMITS title shows the data age. |
 | Claude tokens | `~/.claude/projects/**/*.jsonl` (incremental tail, deduplicated by `requestId` + `message.id`) |
 | opencode tokens/cost | `~/.local/share/opencode/opencode.db` (SQLite, read-only) |
 | Hardware | `/proc/stat`, `/proc/meminfo`, `/proc/diskstats`, `/proc/net/route`, `/sys/class/*` |

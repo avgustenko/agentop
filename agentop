@@ -43,7 +43,7 @@ try:
 except ImportError:
     termios = tty = None
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 VIEWS = ("dashboard", "focus", "system", "compact", "minimal")
 COLOR = (sys.stdout.isatty() and "NO_COLOR" not in os.environ
          and os.environ.get("TERM") != "dumb")
@@ -72,7 +72,9 @@ USAGE_CACHE = CACHE_DIR / "usage.json"
 CLAUDE_CACHE = CACHE_DIR / "claude_today.json"
 TAIL_CACHE = CACHE_DIR / "tail.json"
 
-TTL_LIMITS = 300
+TTL_LIMITS = 30
+TTL_LIMITS_FALLBACK = 300
+LIMITS_REFRESH = 30
 TTL_CLAUDE = 300
 TTL_OC = 30.0
 TTL_CPU = 2.0
@@ -391,11 +393,21 @@ def clear_cache():
 
 
 # ───────────────────────────── Claude ─────────────────────────────
+def age_label(seconds):
+    seconds = int(max(0, seconds))
+    if seconds < 90:
+        return f"{seconds}с"
+    return f"{seconds // 60}м"
+
+
 def claude_limits(ttl=TTL_LIMITS, force=False):
     if not force and USAGE_CACHE.exists():
         try:
             if time.time() - USAGE_CACHE.stat().st_mtime < ttl:
-                return json.loads(USAGE_CACHE.read_text())
+                data = json.loads(USAGE_CACHE.read_text())
+                if "_fetched_at" not in data:
+                    data["_fetched_at"] = USAGE_CACHE.stat().st_mtime
+                return data
         except Exception:
             pass
 
@@ -420,6 +432,7 @@ def claude_limits(ttl=TTL_LIMITS, force=False):
     try:
         with urllib.request.urlopen(req, timeout=4) as r:
             data = json.loads(r.read().decode())
+        data["_fetched_at"] = time.time()
         tmp = USAGE_CACHE.with_suffix(".tmp")
         tmp.write_text(json.dumps(data))
         os.chmod(tmp, 0o600)
@@ -431,7 +444,11 @@ def claude_limits(ttl=TTL_LIMITS, force=False):
             if USAGE_CACHE.exists():
                 try:
                     os.utime(USAGE_CACHE, None)
-                    return json.loads(USAGE_CACHE.read_text())
+                    data = json.loads(USAGE_CACHE.read_text())
+                    data["_throttled"] = True
+                    if "_fetched_at" not in data:
+                        data["_fetched_at"] = USAGE_CACHE.stat().st_mtime
+                    return data
                 except Exception:
                     pass
             return {"error": "Claude API: 429, попробуйте позже"}
@@ -443,6 +460,8 @@ def claude_limits(ttl=TTL_LIMITS, force=False):
         try:
             data = json.loads(USAGE_CACHE.read_text())
             data["_stale"] = True
+            if "_fetched_at" not in data:
+                data["_fetched_at"] = USAGE_CACHE.stat().st_mtime
             return data
         except Exception:
             pass
@@ -1322,6 +1341,14 @@ class App:
         self.view = cfg.get("view", "dashboard")
         if self.view not in VIEWS:
             self.view = "dashboard"
+        self._threaded = threaded
+        try:
+            cached = json.loads(USAGE_CACHE.read_text())
+            if isinstance(cached, dict) and not cached.get("error"):
+                self.cache["limits"] = cached
+        except Exception:
+            pass
+        self.ts["limits"] = time.time() if threaded else 0.0
         if threaded:
             self._limits_thread = threading.Thread(target=self._limits_worker, daemon=True)
             self._limits_thread.start()
@@ -1330,15 +1357,23 @@ class App:
 
     def _limits_worker(self):
         # фоновое обновление лимитов — не блокирует интерфейс
+        delay = 0
         while True:
+            if delay:
+                time.sleep(delay)
             try:
                 data = claude_limits(force=True)
+                ok = (bool(data) and not data.get("error")
+                      and not data.get("_throttled") and not data.get("_stale"))
                 if data and not data.get("error"):
                     self.cache["limits"] = data
                     self.ts["limits"] = time.time()
+                if ok:
+                    delay = LIMITS_REFRESH
+                else:
+                    delay = min(300, max(60, (delay or LIMITS_REFRESH) * 2))
             except Exception:
-                pass
-            time.sleep(TTL_LIMITS)
+                delay = min(300, max(60, (delay or LIMITS_REFRESH) * 2))
 
     def _due(self, key, ttl):
         return key not in self.ts or (time.time() - self.ts[key]) >= ttl
@@ -1349,9 +1384,20 @@ class App:
         show = _show_cfg(self.cfg)
         changed = False
 
-        if self.force_limits or "limits" not in self.cache or self._due("limits", TTL_LIMITS):
-            c["limits"] = claude_limits(force=self.force_limits)
+        if self.force_limits:
+            c["limits"] = claude_limits(force=True)
             self.force_limits = False
+            self.ts["limits"] = now
+            changed = True
+        elif not self._threaded:
+            if "limits" not in self.cache or self._due("limits", TTL_LIMITS):
+                c["limits"] = claude_limits()
+                self.ts["limits"] = now
+                changed = True
+            else:
+                c["limits"] = self.cache.get("limits")
+        elif self._due("limits", TTL_LIMITS_FALLBACK):
+            c["limits"] = claude_limits()
             self.ts["limits"] = now
             changed = True
         else:
@@ -1472,9 +1518,20 @@ def _footer(app, W, paused):
     return frame_bottom(t, W, hint)
 
 
+def limits_title(data):
+    lim = data.get("limits") or {}
+    fa = lim.get("_fetched_at")
+    title = "LIMITS"
+    if fa:
+        title += f" · {age_label(time.time() - fa)}"
+    if lim.get("_throttled"):
+        title += " · 429"
+    return title
+
+
 def _agent_blocks(app, data, t, cw, decimals):
     return [
-        ("limits", "LIMITS", limits_lines(data["limits"], t, cw, decimals), False),
+        ("limits", limits_title(data), limits_lines(data["limits"], t, cw, decimals), False),
         ("tokens", "ТОКЕНЫ · СЕГОДНЯ",
          tokens_lines(data["claude"], data["opencode"], t, cw), False),
         ("speed", "СКОРОСТЬ ТОКЕНОВ · 15 МИН", None, False),
@@ -1630,7 +1687,7 @@ def _double_column(app, data, W, H, show_ms, paused):
 
     def build(per_core=True, optional=True):
         left = []
-        left += col("LIMITS", limits_lines(data["limits"], t, lw, decimals), lw)
+        left += col(limits_title(data), limits_lines(data["limits"], t, lw, decimals), lw)
         left += col("ТОКЕНЫ · СЕГОДНЯ", tokens_lines(data["claude"], data["opencode"], t, lw), lw)
         left += col("СКОРОСТЬ ТОКЕНОВ", speed_lines(data["speed"], t, lw, big=False), lw)
 
